@@ -11,5 +11,5 @@ The spec is `PING_MEMBER_BOT_SPEC.md`. These overrides take precedence over it.
 - **`REMOVALS_ENABLED` stays `false`.**
 - **One phase at a time.** Build only the requested phase, then stop at the checkpoint and give the owner a "how to test this" list. Don't start the next phase.
 - **Ask first** about any decision the spec doesn't cover.
-- **Git:** don't commit or push until the owner says so.
+- **Git sync:** this project is worked on from 3 devices. At the **beginning and end of every session**, always `git pull`, commit and `git push`. This is standing permission. Never commit `.env` or `data/`.
 - **Commands:** the owner uses a Mac. Write commands in the README and test lists as `.venv/bin/python ...`.
