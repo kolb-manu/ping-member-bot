@@ -26,6 +26,9 @@ class User:
     blocked_bot: bool = False
     banned: bool = False
     last_synced_at: datetime | None = None
+    sub_trial_end: datetime | None = None
+    sub_period_start: datetime | None = None
+    past_due_since: datetime | None = None   # start of the first unpaid period while past_due
 
     @classmethod
     def from_row(cls, row: Mapping) -> "User":
@@ -47,4 +50,7 @@ class User:
             blocked_bot=bool(row["blocked_bot"]),
             banned=bool(row["banned"]),
             last_synced_at=from_iso(row["last_synced_at"]),
+            sub_trial_end=from_iso(row["sub_trial_end"]),
+            sub_period_start=from_iso(row["sub_period_start"]),
+            past_due_since=from_iso(row["past_due_since"]),
         )

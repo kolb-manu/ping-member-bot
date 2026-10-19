@@ -148,26 +148,65 @@ async def test_banned_user_start_reply_has_no_buttons(db):
 
 
 async def test_trial_button_refuses_banned_and_unknown(db):
+    # The trial button now opens a Stripe Checkout (phase 2); banned and
+    # never-started users still get an alert and nothing is started for them.
     from types import SimpleNamespace
     from first_in_bot import texts
-    from first_in_bot.handlers.start import on_trial_start
+    from first_in_bot.handlers.billing import on_checkout_button
+    from tests.fakes import FakeStripe, FakeTelegram, make_svc
 
     class FakeCallback:
         def __init__(self, uid):
             self.from_user = SimpleNamespace(id=uid)
+            self.data = "trial:start"
             self.answers = []
 
         async def answer(self, text=None, show_alert=False):
             self.answers.append(text)
 
+    stripe = FakeStripe()
+    svc = make_svc(db, FakeTelegram(), stripe)
     await register_user(db, 9, "bad", "Bad", None, NOW)
     async with db.tx() as conn:
         await conn.execute("UPDATE users SET banned=1 WHERE telegram_id=9")
     cb = FakeCallback(9)
-    await on_trial_start(cb, db)
+    await on_checkout_button(cb, svc)
     assert cb.answers == [texts.UNAVAILABLE]
 
     cb = FakeCallback(12345)  # never pressed /start
-    await on_trial_start(cb, db)
+    await on_checkout_button(cb, svc)
     assert cb.answers == [texts.TRIAL_START_FIRST]
     assert (await get_user(db, 9)).trial_started_at is None
+    assert stripe.created == [] and stripe.customers == []
+
+
+async def test_upgrade_from_schema_2_keeps_past_due_access(tmp_path):
+    """Rows synced before migration 3 have no period start; the old rule applies
+    to them until the next sync, so the upgrade can't cut anyone off."""
+    from datetime import timedelta
+
+    import aiosqlite
+
+    from first_in_bot import db as db_module
+    from first_in_bot.entitlement import is_entitled
+
+    path = str(tmp_path / "old.db")
+    conn = await aiosqlite.connect(path, isolation_level=None)
+    for migration in db_module.MIGRATIONS[:2]:
+        await migration(conn)
+    await conn.execute("CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT)")
+    await conn.execute("INSERT INTO kv VALUES('schema_version', '2')")
+    await conn.execute(
+        "INSERT INTO users(telegram_id, created_at, sub_status, sub_period_end) VALUES(1, ?, 'past_due', ?)",
+        ("2026-10-01T00:00:00+00:00", "2026-11-01T11:00:00+00:00"),
+    )
+    await conn.close()
+
+    d = await Database.open(path)
+    try:
+        assert (await d.fetchone("SELECT value FROM kv WHERE key='schema_version'"))["value"] == "3"
+        user = await get_user(d, 1)
+        assert user.sub_period_start is None and user.past_due_since is None
+        assert is_entitled(user, NOW, timedelta(hours=72))
+    finally:
+        await d.close()
