@@ -61,9 +61,9 @@ def buttons(markup):
 # --- welcome --------------------------------------------------------------------
 
 def test_welcome_offers_trial_with_price_and_card_wording():
-    text = welcome_text(User(telegram_id=1), PRICE)
-    assert "Your first 2 weeks are free, then £2.99/month" in text
-    assert "won't pay" in text and "No card needed" not in text
+    text = welcome_text(User(telegram_id=1), PRICE, load_config(GOOD))
+    assert "Your first 14 days are free, then £2.99/month" in text
+    assert "A card is required" in text and "/manage" in text and "No card needed" not in text
 
 
 def test_welcome_for_returning_user_offers_subscription():
@@ -86,9 +86,11 @@ def test_welcome_keyboard_trial_button_is_checkout():
     (User(telegram_id=1, trial_started_at=NOW - 40 * D), False),
 ])
 def test_how_it_works_only_promises_a_trial_to_the_eligible(user, trial):
-    text = how_it_works_text(user, PRICE)
-    assert ("first 2 weeks" in text) is trial
+    text = how_it_works_text(user, PRICE, load_config(GOOD), NOW)
+    assert ("14 days free" in text) is trial
     assert ("Tap <b>Subscribe</b> and pay £2.99/month" in text) is not trial
+    if trial:
+        assert "A card is required" in text and "15 Nov 2026" in text and "/manage" in text
 
 
 def test_copy_never_says_no_card_or_reselling():
@@ -102,7 +104,7 @@ def test_copy_never_says_no_card_or_reselling():
 def test_brand_name_never_ping_in_code():
     root = Path(__file__).resolve().parent.parent / "first_in_bot"
     for path in root.rglob("*.py"):
-        assert not re.search(r"\bPing\b", path.read_text()), path
+        assert not re.search(r"\bPing\b", path.read_text(encoding="utf-8")), path
 
 
 # --- checkout buttons ----------------------------------------------------------
@@ -122,7 +124,11 @@ async def test_trial_button_sends_checkout_link(svc, tg, stripe_fake):
     await billing_handlers.on_checkout_button(cb, svc)
     assert cb.answers == [("Opening checkout…", False)]   # answered before Stripe is called
     [text] = tg.sent_to(1)
-    assert "start your free 2 weeks" in text and "£2.99/month is charged automatically" in text
+    # Everything the buyer must know before the Stripe link.
+    assert "14 days free" in text and "£2.99/month" in text
+    assert "A card is required" in text
+    assert "first payment is taken on <b>15 Nov 2026</b>" in text
+    assert "Cancel any time before then with /manage" in text
     url_button, done_button = buttons(tg.markups_to(1)[0])
     assert url_button.url == "https://checkout.stripe.test/cs_1"
     assert done_button.callback_data == "paid:check" and done_button.text == "I've added my card"
@@ -378,3 +384,20 @@ async def test_dryrun_command_reports_regardless_of_fingerprint(svc, tg):
         await admin_handlers.cmd_dryrun(msg, svc)
         assert "Would remove (1): 5 @user5" in msg.answers[0][0]
     assert tg.calls("kick") == [] and tg.sent_to(5) == []
+
+
+async def test_terms_state_the_trial_facts_with_the_first_charge_date(svc, tg):
+    msg = FakeMessage(1)
+    await billing_handlers.cmd_terms(msg, svc)
+    [(text, _)] = msg.answers
+    assert "14 days free" in text and "£2.99/month" in text and "A card is required" in text
+    assert "first payment is taken on <b>15 Nov 2026</b>" in text
+    assert "3 days before your first payment" in text and "/manage" in text
+    assert "not affiliated with FIXR" in text
+
+
+async def test_cancelled_trial_status_says_access_until_trial_end(svc):
+    await add_user(svc.db, 1, stripe_sub_id="sub_1", sub_status="canceled", sub_trial_end=NOW + 3 * D)
+    reply = await billing_handlers.status_reply(svc, 1, NOW)
+    assert "You've cancelled" in reply.text and "won't be charged" in reply.text
+    assert texts.STATUS_ACCESS_YES in reply.text

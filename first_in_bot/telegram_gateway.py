@@ -187,10 +187,11 @@ class TelegramGateway:
             return "left"
         return str(status)
 
-    async def kick(self, user_id: int) -> bool:
+    async def kick(self, user_id: int, permanent: bool = False) -> bool:
         """Remove from the paid channel but allow rejoining later (ban + unban).
-        'Not a member' counts as success."""
-        log.info("Paid channel: removing %s", user_id)
+        permanent=True (users flagged banned) skips the unban. 'Not a member' counts
+        as success."""
+        log.info("Paid channel: removing %s%s", user_id, " (permanent ban)" if permanent else "")
         try:
             await self._call("ban_chat_member", lambda: self.bot.ban_chat_member(self.paid_channel_id, user_id))
         except TelegramBadRequest as exc:
@@ -202,6 +203,8 @@ class TelegramGateway:
         except _API_FAILURES as exc:
             log.error("Could not remove %s: %s", user_id, _describe(exc))
             return False
+        if permanent:
+            return True
         try:
             await self._call(
                 "unban_chat_member",
@@ -211,6 +214,20 @@ class TelegramGateway:
             # They're out, but still banned, so they couldn't rejoin after paying.
             log.error("Removed %s but the unban failed, they stay banned until unbanned: %s",
                       user_id, _describe(exc))
+        return True
+
+    async def unban(self, user_id: int) -> bool:
+        """Lift a permanent ban so they can request to join again (only_if_banned: a
+        no-op for anyone who isn't banned)."""
+        log.info("Paid channel: lifting any ban on %s", user_id)
+        try:
+            await self._call(
+                "unban_chat_member",
+                lambda: self.bot.unban_chat_member(self.paid_channel_id, user_id, only_if_banned=True),
+            )
+        except _API_FAILURES as exc:
+            log.error("Could not lift the ban on %s: %s", user_id, _describe(exc))
+            return False
         return True
 
     async def bot_rights_problems(self, bot_id: int) -> list[str]:

@@ -153,11 +153,29 @@ async def _m003_past_due_anchor(conn: aiosqlite.Connection) -> None:
         await conn.execute(stmt)
 
 
+async def _m004_disputes(conn: aiosqlite.Connection) -> None:
+    # Payment disputes seen at Stripe. One row per dispute, so a dispute is only ever
+    # alerted once and its later status changes (won/lost) can be followed.
+    await conn.execute(
+        """CREATE TABLE disputes(
+            id          TEXT PRIMARY KEY,
+            telegram_id INTEGER,
+            customer_id TEXT,
+            charge_id   TEXT,
+            status      TEXT NOT NULL,
+            created_at  TEXT,
+            seen_at     TEXT NOT NULL,
+            alerted     INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
+
+
 # Append new migrations to the end; never edit or reorder old ones.
 MIGRATIONS: list[Callable[[aiosqlite.Connection], Awaitable[None]]] = [
     _m001_initial,
     _m002_stripe_trial,
     _m003_past_due_anchor,
+    _m004_disputes,
 ]
 
 

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from .billing import poll_checkouts, sync_subscriptions
+from .disputes import check_disputes
 from .notices import send_notices
 from .services import Services
 from .sweep import sweep_removals
@@ -34,6 +35,7 @@ def build_jobs(svc: Services) -> list[Job]:
             # Sync first, straight away, so the sweep isn't stale right after a restart.
             Job("sync_subscriptions", 300, lambda: sync_subscriptions(svc, svc.now()), initial_delay=0),
             Job("poll_checkouts", 30, lambda: poll_checkouts(svc, svc.now()), initial_delay=5),
+            Job("check_disputes", 86400, lambda: check_disputes(svc, svc.now()), initial_delay=120),
         ]
     jobs += [
         Job("send_notices", 300, lambda: send_notices(svc, svc.now()), initial_delay=30),

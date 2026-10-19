@@ -152,7 +152,7 @@ async def test_completed_trial_checkout_applies_sub_and_welcomes_once(svc, strip
     messages = tg.sent_to(1)
     assert len(messages) == 1
     assert "free trial is on until <b>15 Nov 2026, 12:00</b>" in messages[0]
-    assert "£2.99/month is charged automatically" in messages[0]
+    assert "first payment of £2.99/month is taken on that date" in messages[0]
     join = tg.markups_to(1)[0].inline_keyboard[0][0]
     assert join.url == svc.config.paid_join_request_link
 

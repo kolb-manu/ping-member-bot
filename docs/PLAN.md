@@ -114,7 +114,7 @@ A separate task. It adds a list of destinations, each with its own delay. It is 
 1. **Arrive.** A TikTok or Instagram bio link opens the member bot with a source tag, for example `?start=tt_v1`. This shows which video brought each person. Only the first real tag is kept.
 2. **Welcome.** The bot sends a welcome message with a "Start my free 2 weeks" button.
 3. **Trial.** The trial runs through Stripe (owner decision 2026-10-18): the button opens Stripe Checkout, the person adds a card, and the 14 days start when they finish checkout, not at `/start`. Nothing is charged during the trial; after it, the monthly price is charged automatically unless they cancel. One trial per person, enforced in the database.
-4. **Reminder.** One reminder 2 days before the trial converts, with the date, the price and how to cancel (`/manage`). Sent only once.
+4. **Reminders.** Before the Stripe link the bot states the price and interval, the trial length, the first-charge date, that a card is required, and that they can cancel before then with `/manage`. Later, one reminder `TRIAL_REMINDER_DAYS_BEFORE` days before the first charge (default 3) and a last-day one about 3 hours before, each with the date, the price and how to cancel. Each is sent once per trial and never to someone who cancelled.
 5. **Trial ends.** If they kept the subscription, nothing changes and they're charged. If they cancelled (or the payment fails past the grace period), they're removed from the paid channel and pointed to the free channel.
 6. **Paying.** People who've already had their trial get a Subscribe button instead, then Stripe Checkout. The bot polls Stripe every 30 seconds, sees the payment and lets them in.
 7. **Managing.** `/manage` opens the Stripe portal. Cancelling keeps access until the end of the paid period. Failed payments get a short grace period.
@@ -174,7 +174,8 @@ This is not legal advice.
 | FIXR terms | Polling venue pages is low-profile for personal use, but a paid service is more visible. We could be blocked or asked to stop. | Keep polling gentle. **TO CHECK** their terms. |
 | Ticketing law and venue rules | Rules on ticket transfers and automated access are tightening. Our service only sends alerts and never buys tickets. | **TO CHECK** current UK rules before scaling. |
 | Consumer law | Real payments need terms, a refund and cancellation policy, and clear price display. | The `/terms` text in the bot is a plain-English draft and must be reviewed before go-live. |
-| Trial reminders | Card-network rules (e.g. Mastercard) may require a reminder 3 to 7 days before a card-required trial converts. The bot's DM is 2 days before. | **TO CHECK** current rules. Turn on Stripe's 7-day trial reminder email before go-live (README checklist). Owner to decide whether the bot's reminder moves earlier. |
+| Trial reminders | Card-network rules (e.g. Mastercard) may require a reminder 3 to 7 days before a card-required trial converts. The bot's first reminder is `TRIAL_REMINDER_DAYS_BEFORE` days before (default 3), plus a last-day one. | **TO CHECK** current rules. Turn on Stripe's 7-day trial reminder email before go-live (README checklist). Owner to decide whether the bot's reminder moves earlier. |
+| Auto-converting free trials | A card-required free trial that turns into a paid subscription automatically is regulated more tightly than a plain subscription (clear upfront terms, reminders, easy cancellation). | **TO CHECK: UK rules on reminders and cancellation for auto-converting free trials before going live.** |
 | Tax | Trading income above £1,000 a year needs registering with HMRC. | **TO CHECK** |
 | Telegram dependency | If Telegram changes its rules or bans a channel, we lose the audience. | Plan a way to contact members later (for example collecting emails). |
 | Data | The member database holds Telegram IDs and usernames. | Keep it private, backed up and out of Git. Never commit `.env` or `data/`. |
@@ -190,8 +191,8 @@ This is not legal advice.
 
 | Phase | What |
 |---|---|
-| 2 | Free trial via Stripe Checkout (test mode), payment polling, full subscription sync, `/manage`, channel access, the trial reminder, dry-run removals, admin commands. Built, waiting for the owner's checkpoint test. |
-| 3 | Stripe disputes check and the test-clock script |
+| 2 | Free trial via Stripe Checkout (test mode), payment polling, full subscription sync, `/manage`, channel access, the trial reminders, dry-run removals, admin commands. Merged. |
+| 3 | Disputes check, test-clock script, `/revoke` `/ban` `/unban`, pre-checkout trial terms, configurable reminders. Built on branch `trial-polish`, waiting for the owner's checkpoint test. |
 | 4 | Hardening, owner alerts, backups, deploy to the server |
 | 5 | Go-live. The owner's decision only. |
 

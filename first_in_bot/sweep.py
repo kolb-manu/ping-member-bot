@@ -267,7 +267,7 @@ async def _remove(svc: Services, user: User, report: SweepReport, now: datetime)
         # The DM can take seconds (retries, flood waits), so check once more.
         if await _recheck(svc, user, report, now) is None:
             return
-    if await svc.tg.kick(user.telegram_id):
+    if await svc.tg.kick(user.telegram_id, permanent=user.banned):
         async with svc.db.tx() as conn:
             await conn.execute("UPDATE users SET in_paid_channel=0 WHERE telegram_id=?", (user.telegram_id,))
             await audit(conn, now, user.telegram_id, "removed", ENDED_LABELS[kind])
@@ -276,6 +276,36 @@ async def _remove(svc: Services, user: User, report: SweepReport, now: datetime)
         async with svc.db.tx() as conn:
             await audit(conn, now, user.telegram_id, "remove_failed", ENDED_LABELS[kind])
         report.failed.append(user.telegram_id)
+
+
+async def remove_one(svc: Services, user: User, now: datetime) -> str:
+    """Admin /revoke and /ban: take one person out of the channel through the same
+    checks as the sweep (not an admin, Telegram confirms they're in, not entitled,
+    Stripe data fresh), but only when removals are switched on. Returns a sentence
+    for the admin saying what happened."""
+    if not svc.config.removals_enabled:
+        return ("REMOVALS_ENABLED is false, so I did not remove them from the channel. "
+                "/dryrun shows who the sweep would remove.")
+    if svc.entitled(user, now):
+        return "They still have access another way (trial, subscription or grant), so I did not remove them."
+    last_sync = from_iso(await svc.db.kv_get(LAST_FULL_SYNC_KEY))
+    # A banned user is not entitled whatever Stripe says, so a stale sync doesn't matter.
+    sync_fresh = user.banned or (last_sync is not None and now - last_sync < SYNC_MAX_AGE)
+    reason = await _skip_reason(svc, user, sync_fresh, now)
+    if reason == "not_in_channel":
+        return "They aren't in the paid channel."
+    if reason is not None:
+        return f"Not removed: {SKIP_LABELS[reason]}."
+    if not user.in_paid_channel:
+        await set_in_channel(svc, user.telegram_id, True, now, "admin removal found them in the channel")
+    report = SweepReport(dry_run=False)
+    await _remove(svc, user, report, now)
+    if report.removed:
+        return "Removed from the paid channel."
+    if report.failed:
+        return "Telegram refused to remove them. Check the bot still has the Ban users right."
+    skipped = report.skipped[-1][1] if report.skipped else "unknown"
+    return f"Not removed: {SKIP_LABELS.get(skipped, skipped)}."
 
 
 async def sweep_removals(svc: Services, now: datetime, *, force_dry_run: bool = False) -> SweepReport:

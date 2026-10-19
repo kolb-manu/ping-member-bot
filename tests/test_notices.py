@@ -1,4 +1,5 @@
-"""The 2-days-before-the-trial-converts reminder (send_notices job)."""
+"""The pre-charge trial reminders (send_notices job): the early one, N days before
+the first charge, and the last-day one about 3 hours before."""
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -7,7 +8,7 @@ from first_in_bot.notices import send_notices
 from first_in_bot.telegram_gateway import SendResult
 from first_in_bot.timeutil import to_iso
 from first_in_bot.users import get_user
-from tests.fakes import NOW, add_user
+from tests.fakes import NOW, add_user, make_svc
 
 H = timedelta(hours=1)
 
@@ -30,19 +31,20 @@ async def test_due_reminder_sent_once(svc, tg):
     assert "ends on <b>2 Nov 2026, 12:00</b>" in text
     assert "£2.99/month is charged automatically" in text and "/manage" in text
     assert tg.markups_to(1)[0].inline_keyboard[0][0].callback_data == "manage"
-    assert await notice_rows(svc.db) == [(1, "trial_2d", to_iso(end))]
+    assert await notice_rows(svc.db) == [(1, "trial_reminder", to_iso(end))]
 
     assert await send_notices(svc, NOW + 5 * timedelta(minutes=1)) == 0
     assert len(tg.sent_to(1)) == 1
 
 
 @pytest.mark.parametrize("end,due", [
-    (NOW + timedelta(days=3), False),
-    (NOW + timedelta(days=2, seconds=1), False),
-    (NOW + timedelta(days=2), True),          # window opens exactly 2 days before
-    (NOW + H, True),
+    (NOW + timedelta(days=4), False),
+    (NOW + timedelta(days=3, seconds=1), False),
+    (NOW + timedelta(days=3), True),          # window opens exactly 3 days before (the default)
+    (NOW + timedelta(days=1), True),
+    (NOW + H, True),                          # inside the last 3 hours: the final reminder goes instead
     (NOW, False),                             # trial already over
-    (NOW - H, False),                         # bot was down; no "2 days left" after the end
+    (NOW - H, False),                         # bot was down; no reminder after the end
 ])
 async def test_reminder_window(svc, tg, end, due):
     await add_user(svc.db, 1, **trialing(end))
@@ -112,3 +114,77 @@ async def test_unexpected_send_error_frees_the_row_so_it_retries(svc, tg):
     assert await notice_rows(svc.db) == []   # not lost: the pre-charge reminder is retried
     tg.send = real_send
     assert await send_notices(svc, NOW + timedelta(minutes=5)) == 1
+
+
+# --- configurable lead and the last-day reminder ---------------------------------
+
+async def kinds_sent(db):
+    return [r["kind"] for r in await db.fetchall("SELECT kind FROM notices_sent ORDER BY sent_at, kind")]
+
+
+async def test_reminder_lead_is_a_setting(db, tg, stripe_fake):
+    svc = make_svc(db, tg, stripe_fake, TRIAL_REMINDER_DAYS_BEFORE="5")
+    await add_user(db, 1, **trialing(NOW + timedelta(days=5)))
+    await add_user(db, 2, **trialing(NOW + timedelta(days=5, seconds=1)))
+    assert await send_notices(svc, NOW) == 1
+    assert tg.sent_to(1) and not tg.sent_to(2)
+
+
+@pytest.mark.parametrize("end,due", [
+    (NOW + timedelta(hours=3, seconds=1), False),   # still the early reminder's window
+    (NOW + timedelta(hours=3), True),               # opens exactly 3 hours before
+    (NOW + timedelta(minutes=1), True),
+    (NOW, False),
+])
+async def test_final_reminder_window(svc, tg, end, due):
+    await add_user(svc.db, 1, **trialing(end))
+    # The early reminder was already sent, so only the final one can still go out.
+    async with svc.db.tx() as conn:
+        await conn.execute("INSERT INTO notices_sent VALUES(1, 'trial_reminder', ?, ?)",
+                           (to_iso(end), to_iso(NOW)))
+    assert await send_notices(svc, NOW) == int(due)
+    if due:
+        assert "ends in a few hours" in tg.sent_to(1)[0] and "/manage" in tg.sent_to(1)[0]
+        assert "£2.99/month" in tg.sent_to(1)[0]
+
+
+async def test_both_reminders_go_out_once_each_over_a_trial(svc, tg):
+    end = NOW + timedelta(days=14)
+    await add_user(svc.db, 1, **trialing(end))
+    for t in (end - timedelta(days=4), end - timedelta(days=3), end - timedelta(days=2),
+              end - timedelta(hours=4), end - timedelta(hours=3), end - timedelta(hours=1)):
+        await send_notices(svc, t)
+        await send_notices(svc, t + timedelta(minutes=5))        # job runs again: nothing new
+    assert sorted(await notice_rows(svc.db)) == sorted([(1, "trial_final", to_iso(end)),
+                                                       (1, "trial_reminder", to_iso(end))])
+    assert len(tg.sent_to(1)) == 2
+    assert "ends on" in tg.sent_to(1)[0] and "ends in a few hours" in tg.sent_to(1)[1]
+
+
+async def test_down_through_early_window_sends_only_the_final_reminder(svc, tg):
+    end = NOW + timedelta(hours=2)
+    await add_user(svc.db, 1, **trialing(end))
+    assert await send_notices(svc, NOW) == 1
+    assert await kinds_sent(svc.db) == ["trial_final"]
+    assert await send_notices(svc, NOW + timedelta(minutes=5)) == 0
+
+
+@pytest.mark.parametrize("hours_before", [30, 2])
+async def test_cancelled_during_the_trial_gets_no_reminder(svc, tg, hours_before):
+    end = NOW + timedelta(hours=hours_before)
+    await add_user(svc.db, 1, **trialing(end, cancel_at_period_end=True))
+    await add_user(svc.db, 2, **{**trialing(end), "sub_status": "canceled"})   # cancelled at once
+    assert await send_notices(svc, NOW) == 0
+    assert tg.events == [] and await notice_rows(svc.db) == []
+
+
+async def test_each_trial_cycle_gets_its_own_notices(svc, tg):
+    end = NOW + timedelta(hours=2)
+    await add_user(svc.db, 1, **trialing(end))
+    await send_notices(svc, NOW)
+    # A later trial (new trial end) is a new cycle key, so it is notified again.
+    new_end = NOW + timedelta(days=60, hours=2)
+    async with svc.db.tx() as conn:
+        await conn.execute("UPDATE users SET sub_trial_end=? WHERE telegram_id=1", (to_iso(new_end),))
+    assert await send_notices(svc, new_end - timedelta(hours=1)) == 1
+    assert len(tg.sent_to(1)) == 2

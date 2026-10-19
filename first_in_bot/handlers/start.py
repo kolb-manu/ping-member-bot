@@ -1,6 +1,8 @@
 """/start, the welcome screen and "How it works"."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from aiogram import F, Router
 from aiogram.filters import CommandObject, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -10,7 +12,7 @@ from ..config import Config
 from ..db import Database
 from ..keyboards import CB_HOW, checkout_button
 from ..models import User
-from ..timeutil import utcnow
+from ..timeutil import format_local_date, utcnow
 from ..users import get_user, register_user, trial_eligible
 
 router = Router(name="start")
@@ -29,10 +31,10 @@ def welcome_keyboard(user: User, config: Config) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def welcome_text(user: User, price_label: str | None) -> str:
+def welcome_text(user: User, price_label: str | None, config: Config) -> str:
     price = texts.price_text(price_label)
     offer = texts.OFFER_TRIAL if trial_eligible(user) else texts.OFFER_SUBSCRIBE
-    return texts.WELCOME.format(offer=offer.format(price=price))
+    return texts.WELCOME.format(offer=offer.format(price=price, days=config.trial_days))
 
 
 def start_reply(
@@ -40,7 +42,7 @@ def start_reply(
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     if user.banned:
         return texts.UNAVAILABLE, None
-    return welcome_text(user, price_label), welcome_keyboard(user, config)
+    return welcome_text(user, price_label, config), welcome_keyboard(user, config)
 
 
 @router.message(CommandStart())
@@ -61,15 +63,20 @@ async def on_start(
     await message.answer(text, reply_markup=markup)
 
 
-def how_it_works_text(user: User | None, price_label: str | None) -> str:
+def how_it_works_text(user: User | None, price_label: str | None, config: Config, now: datetime) -> str:
     # Only promise a free trial to people who can still have one.
-    template = texts.HOW_IT_WORKS_TRIAL if user is None or trial_eligible(user) else texts.HOW_IT_WORKS_SUBSCRIBE
-    return template.format(price=texts.price_text(price_label))
+    if user is not None and not trial_eligible(user):
+        return texts.HOW_IT_WORKS_SUBSCRIBE.format(price=texts.price_text(price_label))
+    charge_date = format_local_date(now + timedelta(days=config.trial_days), config.timezone)
+    return texts.HOW_IT_WORKS_TRIAL.format(
+        terms=texts.trial_terms(price_label, config.trial_days, charge_date),
+        reminder_days=config.trial_reminder_days_before,
+    )
 
 
 @router.callback_query(F.data == CB_HOW)
-async def on_how(callback: CallbackQuery, db: Database, price_label: str | None = None) -> None:
+async def on_how(callback: CallbackQuery, db: Database, config: Config, price_label: str | None = None) -> None:
     await callback.answer()
     if isinstance(callback.message, Message):
         user = await get_user(db, callback.from_user.id)
-        await callback.message.answer(how_it_works_text(user, price_label))
+        await callback.message.answer(how_it_works_text(user, price_label, config, utcnow()))

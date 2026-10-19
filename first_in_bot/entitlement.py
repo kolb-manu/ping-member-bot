@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from .models import User
 
 ENTITLED_SUB_STATUSES = frozenset({"active", "trialing"})
+# Local sub_status (never a Stripe one): a payment dispute is open. Not entitled.
+DISPUTED_STATUS = "disputed"
 
 
 def past_due_until(user: User, past_due_grace: timedelta) -> datetime | None:
@@ -38,6 +40,10 @@ def is_entitled(user: User, now: datetime, past_due_grace: timedelta) -> bool:
     if user.trial_ends_at and now < user.trial_ends_at:
         return True
     if user.sub_status in ENTITLED_SUB_STATUSES:
+        return True
+    if user.sub_status == "canceled" and user.sub_trial_end and now < user.sub_trial_end:
+        # Cancelled during the free trial (e.g. a portal set to cancel at once): they
+        # keep access until the trial would have ended, and are never charged.
         return True
     if user.sub_status == "past_due":
         until = past_due_until(user, past_due_grace)

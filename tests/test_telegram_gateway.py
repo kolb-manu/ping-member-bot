@@ -245,3 +245,23 @@ async def test_unban_decode_error_still_counts_as_removed():
     bot = ScriptedBot(unban=[unreadable_json()])
     gw, _ = gateway(bot)
     assert await gw.kick(3) is True
+
+
+async def test_permanent_kick_is_ban_only():
+    bot = ScriptedBot()
+    gw, _ = gateway(bot)
+    assert await gw.kick(9, permanent=True) is True
+    assert [c[0] for c in bot.calls] == ["ban"]
+
+
+async def test_unban_lifts_only_an_existing_ban():
+    bot = ScriptedBot()
+    gw, _ = gateway(bot)
+    assert await gw.unban(9) is True
+    assert bot.calls[0][0] == "unban" and bot.calls[0][2] == {"only_if_banned": True}
+
+
+async def test_unban_failure_is_reported():
+    bot = ScriptedBot(unban=[bad_request("not enough rights")])
+    gw, _ = gateway(bot)
+    assert await gw.unban(9) is False

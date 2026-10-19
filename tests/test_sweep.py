@@ -384,3 +384,10 @@ async def test_real_mode_paid_after_trial_then_cancelled_gets_subscription_goodb
     assert tg.sent_to(2) == [texts.SUB_ENDED]
     kinds = [r["kind"] for r in await real_svc.db.fetchall("SELECT kind FROM notices_sent WHERE telegram_id=2")]
     assert kinds == ["sub_ended"]
+
+
+async def test_banned_user_is_removed_permanently_without_a_dm(real_svc, tg):
+    await fresh_sync(real_svc.db)
+    await add_user(real_svc.db, 2, in_paid_channel=True, banned=True)
+    report = await sweep_removals(real_svc, NOW)
+    assert report.removed == [2] and tg.permanent_kicks == [2] and tg.sent_to(2) == []

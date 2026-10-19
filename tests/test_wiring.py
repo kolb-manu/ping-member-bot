@@ -79,7 +79,7 @@ def test_allowed_updates():
 async def test_start_sends_welcome(wiring):
     svc, feed = wiring
     [req] = await feed(message(5, "/start tt_v1"))
-    assert isinstance(req, SendMessage) and "Your first 2 weeks are free, then £2.99/month" in req.text
+    assert isinstance(req, SendMessage) and "Your first 14 days are free, then £2.99/month" in req.text
     assert req.reply_markup.inline_keyboard[0][0].callback_data == "trial:start"
 
 
@@ -129,7 +129,8 @@ async def test_how_it_works_depends_on_trial_eligibility(wiring):
     assert isinstance(requests[0], AnswerCallbackQuery)
     assert requests[-1].text == texts.HOW_IT_WORKS_SUBSCRIBE.format(price=PRICE)
     await add_user(svc.db, 6)
-    assert (await feed(callback(6, "how")))[-1].text == texts.HOW_IT_WORKS_TRIAL.format(price=PRICE)
+    trial_text = (await feed(callback(6, "how")))[-1].text
+    assert "14 days free" in trial_text and "A card is required" in trial_text and "/manage" in trial_text
 
 
 async def test_any_private_message_or_button_clears_blocked_bot(wiring):

@@ -1,4 +1,4 @@
-"""Admin commands: /stats, /user, /grant, /dryrun. Only for ADMIN_IDS; anyone
+"""Admin commands: /stats, /user, /grant, /revoke, /ban, /unban, /dryrun. Only for ADMIN_IDS; anyone
 else gets no reply at all."""
 from __future__ import annotations
 
@@ -69,6 +69,40 @@ async def cmd_grant(message: Message, command: CommandObject, svc: Services) -> 
     else:
         until = format_local(user.manual_grant_until, svc.config.timezone)
         await message.answer(f"✅ {user.telegram_id} has free access until {until}.")
+
+
+async def _target_command(message: Message, command: CommandObject, svc: Services, name: str, action) -> None:
+    """Shared shape of /revoke, /ban and /unban: <id or @username>, then action(svc, user, now, by)."""
+    if not is_admin(message, svc) or message.from_user is None:
+        return
+    ref = (command.args or "").strip()
+    if not ref or len(ref.split()) != 1:
+        await message.answer(f"Usage: /{name} &lt;telegram_id or @username&gt;")
+        return
+    user = await find_user(svc.db, ref)
+    if user is None:
+        await message.answer(NO_SUCH_USER.format(ref=html.escape(ref)))
+        return
+    try:
+        text = await action(svc, user, svc.now(), message.from_user.id)
+    except admin.AdminTarget as exc:
+        text = str(exc)
+    await message.answer(html.escape(text, quote=False))
+
+
+@router.message(Command("revoke"))
+async def cmd_revoke(message: Message, command: CommandObject, svc: Services) -> None:
+    await _target_command(message, command, svc, "revoke", admin.revoke)
+
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message, command: CommandObject, svc: Services) -> None:
+    await _target_command(message, command, svc, "ban", admin.ban)
+
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message, command: CommandObject, svc: Services) -> None:
+    await _target_command(message, command, svc, "unban", admin.unban)
 
 
 @router.message(Command("dryrun"))

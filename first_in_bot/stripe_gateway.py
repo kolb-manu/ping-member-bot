@@ -6,6 +6,8 @@ back as small frozen dataclasses. Each call is logged by name at INFO; the API
 key is never logged. The restricted key only allows: Checkout Sessions write,
 Customers write, Subscriptions read, Customer Portal write, Disputes read and
 reading prices, so don't add calls to other endpoints (no customers.search).
+list_disputes expands each dispute's charge to learn the customer; if Stripe
+rejects that with a permissions error, the key also needs Charges read.
 """
 from __future__ import annotations
 
@@ -79,6 +81,15 @@ class CheckoutInfo:
     subscription: SubInfo | None     # set when the subscription was expanded
 
 
+@dataclass(frozen=True)
+class DisputeInfo:
+    id: str
+    status: str                      # needs_response / under_review / won / lost / warning_*
+    charge_id: str | None
+    customer_id: str | None          # None if the charge wasn't expanded or has no customer
+    created: datetime | None
+
+
 # --- Parsing (pure, tested on plain dict payloads) ------------------------------
 
 def _plain(obj: Any) -> dict:
@@ -138,6 +149,19 @@ def parse_checkout(obj: Any) -> CheckoutInfo:
         expires_at=_ts(d.get("expires_at")) or _EPOCH,
         subscription_id=_id_of(sub),
         subscription=parse_subscription(sub) if isinstance(sub, dict) else None,
+    )
+
+
+def parse_dispute(obj: Any) -> DisputeInfo:
+    d = _plain(obj)
+    charge = d.get("charge")
+    customer = _id_of(charge.get("customer")) if isinstance(charge, dict) else None
+    return DisputeInfo(
+        id=d["id"],
+        status=d.get("status") or "",
+        charge_id=_id_of(charge),
+        customer_id=customer,
+        created=_ts(d.get("created")),
     )
 
 
@@ -259,6 +283,14 @@ class StripeGateway:
                 raise SubscriptionMissing(f"Stripe has no subscription {sub_id}") from exc.__cause__
             raise
         return parse_subscription(sub)
+
+    async def list_disputes(self) -> list[DisputeInfo]:
+        """Every dispute, with its charge expanded so the customer is known."""
+        def fetch_all() -> list[DisputeInfo]:
+            page = self._client.v1.disputes.list({"limit": 100, "expand": ["data.charge"]})
+            return [parse_dispute(d) for d in page.auto_paging_iter()]
+
+        return await self._call("disputes.list", fetch_all)
 
     async def portal_url(self, customer_id: str, return_url: str) -> str:
         try:

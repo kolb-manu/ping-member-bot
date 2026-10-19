@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from . import texts
 from .audit import audit, audit_if_changed
 from .db import Database, kv_set
-from .entitlement import ENTITLED_SUB_STATUSES
+from .entitlement import DISPUTED_STATUS, ENTITLED_SUB_STATUSES
 from .keyboards import join_channel_keyboard
 from .models import User
 from .notices import NoticeOutcome, deliver_notice
@@ -42,7 +42,7 @@ SYNC_RACE_MARGIN = timedelta(seconds=120)
 
 @dataclass(frozen=True)
 class CheckoutOffer:
-    kind: str                 # "checkout" | "already_in" | "fix_payment"
+    kind: str                 # "checkout" | "already_in" | "fix_payment" | "disputed"
     url: str | None = None
     with_trial: bool = False
     reused: bool = False
@@ -83,6 +83,8 @@ async def start_checkout(svc: Services, user: User, now: datetime) -> CheckoutOf
         return CheckoutOffer("already_in")
     if user.sub_status == "past_due":
         return CheckoutOffer("fix_payment")
+    if user.sub_status == DISPUTED_STATUS:
+        return CheckoutOffer("disputed")
 
     with_trial = trial_eligible(user)
     row = await svc.db.fetchone(
@@ -218,10 +220,15 @@ async def write_subscription(
     *,
     sync_started: datetime | None = None,
     snapshot_ids: frozenset[str] = frozenset(),
+    clear_dispute: bool = False,
 ) -> bool:
     """Store sub on the user. The full sync passes sync_started (and the ids it
     listed for this user); then the write is skipped, returning False, when a
-    checkout poll stored newer data meanwhile. The next sync writes it."""
+    checkout poll stored newer data meanwhile. The next sync writes it.
+
+    A user whose sub_status is the local "disputed" keeps it: Stripe knows nothing
+    of it, so every other field is refreshed but the status is left alone. Only
+    the disputes check passes clear_dispute=True, once the dispute is resolved."""
     async with db.tx() as conn:
         cur = await conn.execute(
             "SELECT stripe_sub_id, sub_status, past_due_since, last_synced_at FROM users WHERE telegram_id=?",
@@ -233,6 +240,8 @@ async def write_subscription(
             return False
         # The past-due grace runs from the first unpaid period, even if Stripe is
         # set to leave the subscription past_due and keeps starting new periods.
+        keep_disputed = not clear_dispute and old is not None and old["sub_status"] == DISPUTED_STATUS
+        status = DISPUTED_STATUS if keep_disputed else sub.status
         past_due_since = None
         if sub.status == "past_due":
             same_sub = old is not None and old["stripe_sub_id"] == sub.id
@@ -243,7 +252,7 @@ async def write_subscription(
             "sub_trial_end=?, past_due_since=?, cancel_at_period_end=?, last_synced_at=? WHERE telegram_id=?",
             (
                 sub.id,
-                sub.status,
+                status,
                 to_iso(sub.period_start) if sub.period_start else None,
                 to_iso(sub.period_end) if sub.period_end else None,
                 to_iso(sub.trial_end) if sub.trial_end else None,
@@ -269,9 +278,9 @@ async def write_subscription(
             if cur.rowcount == 1:
                 await audit(conn, now, telegram_id, "trial_started",
                             f"{sub.id} ends {to_iso(sub.trial_end) if sub.trial_end else '?'}")
-        if old is None or (old["stripe_sub_id"], old["sub_status"]) != (sub.id, sub.status):
+        if old is None or (old["stripe_sub_id"], old["sub_status"]) != (sub.id, status):
             before = old["sub_status"] if old is not None and old["sub_status"] else "none"
-            await audit(conn, now, telegram_id, "sub_status", f"{sub.id}: {before} -> {sub.status}")
+            await audit(conn, now, telegram_id, "sub_status", f"{sub.id}: {before} -> {status}")
     return True
 
 
@@ -434,7 +443,7 @@ async def sync_subscriptions(svc: Services, now: datetime) -> SyncResult:
             log.exception("Sync failed for user %s", telegram_id)
             result.ok = False
 
-    # TODO(phase 3): daily disputes check (set sub_status 'disputed', alert the owner).
+    # Disputes are checked by their own daily job (disputes.check_disputes).
     if result.ok:
         async with svc.db.tx() as conn:
             await kv_set(conn, LAST_FULL_SYNC_KEY, to_iso(now))

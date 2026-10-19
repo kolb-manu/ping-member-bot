@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 
 from aiogram import F, Router
@@ -30,6 +30,7 @@ from ..models import User
 from ..services import Services
 from ..status import status_text
 from ..stripe_gateway import CustomerMissing, PortalNotConfigured, StripeGatewayError
+from ..timeutil import format_local_date
 from ..users import get_user
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,18 @@ class Reply:
     text: str
     markup: InlineKeyboardMarkup | None = None
     alert: bool = False   # short; shown as a callback alert when it came from a button
+
+
+def contact_line(svc: Services) -> str:
+    support = svc.config.support_contact
+    return texts.CONTACT_SUPPORT.format(support=html.escape(support)) if support else texts.CONTACT_LATER
+
+
+def trial_terms_text(svc: Services, now: datetime) -> str:
+    """The trial facts for someone starting today: the first charge is trial_days from now."""
+    config = svc.config
+    charge_date = format_local_date(now + timedelta(days=config.trial_days), config.timezone)
+    return texts.trial_terms(svc.price_label, config.trial_days, charge_date)
 
 
 def local_reply(svc: Services, user: User | None) -> Reply | None:
@@ -72,9 +85,13 @@ async def checkout_reply(svc: Services, telegram_id: int, now: datetime, wanted_
         return Reply(texts.ALREADY_SUBSCRIBED, None if user.in_paid_channel else join_channel_keyboard(svc.config))
     if offer.kind == "fix_payment":
         return Reply(texts.PAYMENT_PROBLEM, manage_keyboard())
+    if offer.kind == "disputed":
+        return Reply(texts.DISPUTED_NO_CHECKOUT.format(contact=contact_line(svc)))
     assert offer.url is not None
-    price = texts.price_text(svc.price_label)
-    body = (texts.CHECKOUT_TRIAL if offer.with_trial else texts.CHECKOUT_SUBSCRIBE).format(price=price)
+    if offer.with_trial:
+        body = texts.CHECKOUT_TRIAL.format(terms=trial_terms_text(svc, now))
+    else:
+        body = texts.CHECKOUT_SUBSCRIBE.format(price=texts.price_text(svc.price_label))
     if wanted_trial and not offer.with_trial:
         body = texts.ALREADY_HAD_TRIAL + "\n\n" + body
     body += "\n\n" + texts.CHECKOUT_AFTER.format(done_button=html.escape(done_label(offer.with_trial)))
@@ -93,10 +110,7 @@ async def manage_reply(svc: Services, telegram_id: int, now: datetime) -> Reply:
         url = await svc.stripe.portal_url(user.stripe_customer_id, svc.config.bot_link)
     except PortalNotConfigured:
         log.error("Customer Portal is not activated: Stripe dashboard > Settings > Billing > Customer portal")
-        support = svc.config.support_contact
-        contact = (texts.CONTACT_SUPPORT.format(support=html.escape(support)) if support
-                   else texts.CONTACT_LATER)
-        return Reply(texts.MANAGE_PORTAL_OFF.format(contact=contact))
+        return Reply(texts.MANAGE_PORTAL_OFF.format(contact=contact_line(svc)))
     except CustomerMissing:
         # Deleted at Stripe (e.g. test data reset), so there's nothing to manage.
         # Forget it; their next checkout creates a new customer.
@@ -225,7 +239,11 @@ async def cmd_terms(message: Message, svc: Services) -> None:
     support = svc.config.support_contact
     support_line = texts.TERMS_SUPPORT.format(support=html.escape(support)) if support else ""
     await message.answer(
-        texts.TERMS.format(price=texts.price_text(svc.price_label), support_line=support_line).rstrip()
+        texts.TERMS.format(
+            trial_terms=trial_terms_text(svc, svc.now()),
+            reminder_days=svc.config.trial_reminder_days_before,
+            support_line=support_line,
+        ).rstrip()
     )
 
 

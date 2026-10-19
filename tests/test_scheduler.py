@@ -52,7 +52,9 @@ async def test_job_list_depends_on_stripe(db, stripe_fake):
     no_stripe = [j.name for j in build_jobs(make_svc(db, FakeTelegram(), None))]
     assert no_stripe == ["send_notices", "sweep_removals"]
     jobs = {j.name: j for j in build_jobs(make_svc(db, FakeTelegram(), stripe_fake))}
-    assert set(jobs) == {"sync_subscriptions", "poll_checkouts", "send_notices", "sweep_removals"}
+    assert set(jobs) == {"sync_subscriptions", "poll_checkouts", "check_disputes", "send_notices",
+                         "sweep_removals"}
+    assert jobs["check_disputes"].interval == 86400
     assert jobs["poll_checkouts"].interval == 30 and jobs["sweep_removals"].interval == 600
     assert jobs["sync_subscriptions"].initial_delay < jobs["sweep_removals"].initial_delay
 

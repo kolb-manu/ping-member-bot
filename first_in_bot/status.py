@@ -2,14 +2,21 @@
 rest just describes their trial or subscription, with dates in local time."""
 from __future__ import annotations
 
+import html
 from datetime import datetime
 
 from . import texts
 from .config import Config
-from .entitlement import is_entitled, past_due_until
+from .entitlement import DISPUTED_STATUS, is_entitled, past_due_until
 from .models import User
 from .timeutil import format_local
 from .users import trial_eligible
+
+
+def _contact(config: Config) -> str:
+    if config.support_contact:
+        return texts.CONTACT_SUPPORT.format(support=html.escape(config.support_contact))
+    return texts.CONTACT_LATER
 
 
 def status_text(user: User, now: datetime, config: Config, price_label: str | None) -> str:
@@ -36,6 +43,10 @@ def status_text(user: User, now: datetime, config: Config, price_label: str | No
             detail = texts.STATUS_CANCELLED.format(end=format_local(user.sub_period_end, tz))
         else:
             detail = texts.STATUS_ACTIVE.format(end=format_local(user.sub_period_end, tz), price=price)
+    elif status == DISPUTED_STATUS:
+        detail = texts.STATUS_DISPUTED.format(contact=_contact(config))
+    elif status == "canceled" and user.sub_trial_end and now < user.sub_trial_end:
+        detail = texts.STATUS_TRIAL_CANCELLED.format(end=format_local(user.sub_trial_end, tz))
     elif status == "past_due":
         until = past_due_until(user, config.past_due_grace)
         if until is not None and now < until:

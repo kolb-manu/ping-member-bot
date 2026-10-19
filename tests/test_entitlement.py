@@ -126,3 +126,21 @@ def test_trial_across_october_clock_change():
     u = user(trial_started_at=started, trial_ends_at=ends)
     assert is_entitled(u, ends - timedelta(seconds=1), GRACE)
     assert not is_entitled(u, ends, GRACE)
+
+
+def test_cancelled_during_the_trial_keeps_access_until_the_trial_would_have_ended():
+    # Cancelled at once (e.g. a portal that doesn't wait for the period end): Stripe says
+    # "canceled", but they never paid and were promised the full trial.
+    u = user(sub_status="canceled", sub_trial_end=NOW + 3 * H, sub_period_end=NOW + 3 * H)
+    assert is_entitled(u, NOW, GRACE)
+    assert not is_entitled(u, NOW + 3 * H, GRACE)          # exactly at the trial end
+    assert not is_entitled(user(sub_status="canceled", sub_trial_end=NOW - H), NOW, GRACE)
+
+
+def test_cancelled_trial_with_cancel_at_period_end_stays_trialing_and_entitled():
+    u = user(sub_status="trialing", cancel_at_period_end=True, sub_trial_end=NOW + H)
+    assert is_entitled(u, NOW, GRACE)
+
+
+def test_banned_cancelled_trial_not_entitled():
+    assert not is_entitled(user(sub_status="canceled", sub_trial_end=NOW + H, banned=True), NOW, GRACE)

@@ -27,6 +27,7 @@ class Config:
     paid_join_request_link: str
     free_channel_link: str
     trial_days: int
+    trial_reminder_days_before: int
     past_due_grace: timedelta
     removals_enabled: bool
     max_removals_per_sweep: int
@@ -118,6 +119,7 @@ def load_config(env: Mapping[str, str]) -> Config:
         problems.append("FREE_CHANNEL_LINK must start with https://t.me/")
 
     trial_days = integer("TRIAL_DAYS", 14, 1)
+    reminder_days = integer("TRIAL_REMINDER_DAYS_BEFORE", 3, 1)
     grace_hours = integer("PAST_DUE_GRACE_HOURS", 72, 0)
     max_removals = integer("MAX_REMOVALS_PER_SWEEP", 5, 1)
 
@@ -162,6 +164,7 @@ def load_config(env: Mapping[str, str]) -> Config:
         paid_join_request_link=paid_link,
         free_channel_link=free_link,
         trial_days=trial_days,
+        trial_reminder_days_before=reminder_days,
         past_due_grace=timedelta(hours=grace_hours),
         removals_enabled=removals_enabled,
         max_removals_per_sweep=max_removals,

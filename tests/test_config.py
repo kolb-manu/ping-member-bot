@@ -72,3 +72,11 @@ def test_secrets_never_in_repr_or_errors():
         load_config({**GOOD, "BOT_TOKEN": "bad-token-secret", "STRIPE_API_KEY": "sk_live_zzz"})
     assert "bad-token-secret" not in str(e.value)
     assert "sk_live_zzz" not in str(e.value)
+
+
+def test_trial_reminder_days_default_and_validation():
+    assert load_config(GOOD).trial_reminder_days_before == 3
+    assert load_config({**GOOD, "TRIAL_REMINDER_DAYS_BEFORE": "5"}).trial_reminder_days_before == 5
+    for bad in ("0", "soon"):
+        with pytest.raises(ConfigError):
+            load_config({**GOOD, "TRIAL_REMINDER_DAYS_BEFORE": bad})
