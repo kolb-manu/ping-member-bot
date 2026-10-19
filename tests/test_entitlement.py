@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from first_in_bot.entitlement import is_entitled
+from first_in_bot.entitlement import is_entitled, past_due_until
 from first_in_bot.models import User
 from first_in_bot.timeutil import format_local
 
@@ -56,18 +56,47 @@ def test_other_statuses_not_entitled(status):
     assert not is_entitled(user(sub_status=status, sub_period_end=NOW + H), NOW, GRACE)
 
 
-def test_past_due_within_grace():
-    assert is_entitled(user(sub_status="past_due", sub_period_end=NOW - H), NOW, GRACE)
+# What Stripe really stores for past_due: the renewal (or trial-conversion) invoice
+# already opened the new, unpaid period, so its end is about a month ahead and its
+# start is when payment became due.
+PERIOD = timedelta(days=30)
+
+
+def past_due(started_ago, **kw):
+    start = NOW - started_ago
+    return user(sub_status="past_due", sub_period_start=start, sub_period_end=start + PERIOD, **kw)
+
+
+@pytest.mark.parametrize("ago,entitled", [(H, True), (71 * H, True), (73 * H, False), (10 * 24 * H, False)])
+def test_past_due_grace_counts_from_the_unpaid_period_start(ago, entitled):
+    u = past_due(ago)
+    assert u.sub_period_end > NOW   # the period end is no use for the grace
+    assert is_entitled(u, NOW, GRACE) is entitled
 
 
 def test_past_due_grace_boundary():
-    end = NOW - GRACE
-    assert not is_entitled(user(sub_status="past_due", sub_period_end=end), NOW, GRACE)
-    assert is_entitled(user(sub_status="past_due", sub_period_end=end + timedelta(seconds=1)), NOW, GRACE)
+    assert not is_entitled(past_due(GRACE), NOW, GRACE)
+    assert is_entitled(past_due(GRACE - timedelta(seconds=1)), NOW, GRACE)
+    assert past_due_until(past_due(H), GRACE) == NOW - H + GRACE
 
 
-def test_past_due_without_period_end_not_entitled():
+def test_past_due_since_wins_over_a_newer_period_start():
+    # Stripe set to "leave past_due": a new unpaid period started, but the grace doesn't restart.
+    assert not is_entitled(past_due(H, past_due_since=NOW - 40 * 24 * H), NOW, GRACE)
+    assert is_entitled(past_due(H, past_due_since=NOW - 2 * H), NOW, GRACE)
+
+
+def test_past_due_row_from_before_migration_3_keeps_the_old_rule():
+    # No period start stored until the next sync: the old period-end formula
+    # still applies, so the upgrade itself can't cut anyone off.
+    assert is_entitled(user(sub_status="past_due", sub_period_end=NOW + 20 * 24 * H), NOW, GRACE)
+    assert is_entitled(user(sub_status="past_due", sub_period_end=NOW - H), NOW, GRACE)
+    assert not is_entitled(user(sub_status="past_due", sub_period_end=NOW - GRACE), NOW, GRACE)
+
+
+def test_past_due_without_any_period_not_entitled():
     assert not is_entitled(user(sub_status="past_due"), NOW, GRACE)
+    assert past_due_until(user(sub_status="past_due"), GRACE) is None
 
 
 def test_banned_overrides_everything():

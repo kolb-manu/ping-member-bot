@@ -112,11 +112,11 @@ A separate task. It adds a list of destinations, each with its own delay. It is 
 ## 4. The customer journey
 
 1. **Arrive.** A TikTok or Instagram bio link opens the member bot with a source tag, for example `?start=tt_v1`. This shows which video brought each person. Only the first real tag is kept.
-2. **Welcome.** The bot sends a welcome message with a "Start my free 2 weeks" button (no card needed).
-3. **Trial.** The 14 days start when the button is pressed, not at `/start`. One trial per person, enforced in the database.
-4. **Reminders.** Sent 2 days before the end and on the last day, each only once.
-5. **Trial ends.** The person is removed from the paid channel and pointed to the free channel.
-6. **Paying.** Subscribe button, then Stripe Checkout. The bot polls Stripe every 30 seconds, sees the payment and lets them in.
+2. **Welcome.** The bot sends a welcome message with a "Start my free 2 weeks" button.
+3. **Trial.** The trial runs through Stripe (owner decision 2026-10-18): the button opens Stripe Checkout, the person adds a card, and the 14 days start when they finish checkout, not at `/start`. Nothing is charged during the trial; after it, the monthly price is charged automatically unless they cancel. One trial per person, enforced in the database.
+4. **Reminder.** One reminder 2 days before the trial converts, with the date, the price and how to cancel (`/manage`). Sent only once.
+5. **Trial ends.** If they kept the subscription, nothing changes and they're charged. If they cancelled (or the payment fails past the grace period), they're removed from the paid channel and pointed to the free channel.
+6. **Paying.** People who've already had their trial get a Subscribe button instead, then Stripe Checkout. The bot polls Stripe every 30 seconds, sees the payment and lets them in.
 7. **Managing.** `/manage` opens the Stripe portal. Cancelling keeps access until the end of the paid period. Failed payments get a short grace period.
 
 **Commands:** `/start` `/subscribe` `/manage` `/status` `/help` `/terms`. Admin commands exist for the owner only.
@@ -174,6 +174,7 @@ This is not legal advice.
 | FIXR terms | Polling venue pages is low-profile for personal use, but a paid service is more visible. We could be blocked or asked to stop. | Keep polling gentle. **TO CHECK** their terms. |
 | Ticketing law and venue rules | Rules on ticket transfers and automated access are tightening. Our service only sends alerts and never buys tickets. | **TO CHECK** current UK rules before scaling. |
 | Consumer law | Real payments need terms, a refund and cancellation policy, and clear price display. | The `/terms` text in the bot is a plain-English draft and must be reviewed before go-live. |
+| Trial reminders | Card-network rules (e.g. Mastercard) may require a reminder 3 to 7 days before a card-required trial converts. The bot's DM is 2 days before. | **TO CHECK** current rules. Turn on Stripe's 7-day trial reminder email before go-live (README checklist). Owner to decide whether the bot's reminder moves earlier. |
 | Tax | Trading income above £1,000 a year needs registering with HMRC. | **TO CHECK** |
 | Telegram dependency | If Telegram changes its rules or bans a channel, we lose the audience. | Plan a way to contact members later (for example collecting emails). |
 | Data | The member database holds Telegram IDs and usernames. | Keep it private, backed up and out of Git. Never commit `.env` or `data/`. |
@@ -189,8 +190,8 @@ This is not legal advice.
 
 | Phase | What |
 |---|---|
-| 2 | Trial, channel access, reminders, dry-run removals, admin commands |
-| 3 | Stripe in test mode |
+| 2 | Free trial via Stripe Checkout (test mode), payment polling, full subscription sync, `/manage`, channel access, the trial reminder, dry-run removals, admin commands. Built, waiting for the owner's checkpoint test. |
+| 3 | Stripe disputes check and the test-clock script |
 | 4 | Hardening, owner alerts, backups, deploy to the server |
 | 5 | Go-live. The owner's decision only. |
 
@@ -228,7 +229,7 @@ cp .env.example .env     # then fill in .env yourself
 | `PAID_JOIN_REQUEST_LINK` | `<TEST_CHANNEL_JOIN_REQUEST_LINK>`: invite link with join requests on |
 | `FREE_CHANNEL_LINK` | `<FREE_CHANNEL_LINK>`: a `https://t.me/...` link |
 | `REMOVALS_ENABLED` | Keep `false` |
-| `STRIPE_API_KEY`, `STRIPE_PRICE_ID` | Not needed until phase 3. Test-mode values only. |
+| `STRIPE_API_KEY`, `STRIPE_PRICE_ID` | Needed from phase 2, because the free trial runs through Stripe Checkout: a restricted **test** key (`rk_test_...`) and a test recurring price. Test-mode values only. |
 
 The other keys have defaults. See `.env.example` for the full list.
 

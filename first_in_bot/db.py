@@ -1,6 +1,7 @@
 """SQLite access (WAL, foreign keys) plus a small numbered-migrations system."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -14,6 +15,10 @@ log = logging.getLogger(__name__)
 class Database:
     def __init__(self, conn: aiosqlite.Connection):
         self.conn = conn
+        # Jobs and handlers share this one connection. SQLite can't nest
+        # transactions on a connection, so tx() blocks are run one at a time.
+        # Never await a network call inside tx(): it would hold up every writer.
+        self._tx_lock = asyncio.Lock()
 
     @classmethod
     async def open(cls, path: str) -> "Database":
@@ -34,14 +39,15 @@ class Database:
     @asynccontextmanager
     async def tx(self) -> AsyncIterator[aiosqlite.Connection]:
         """All writes go through this: commit on success, roll back on error."""
-        await self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.conn
-        except BaseException:
-            await self.conn.execute("ROLLBACK")
-            raise
-        else:
-            await self.conn.execute("COMMIT")
+        async with self._tx_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.conn
+            except BaseException:
+                await self.conn.execute("ROLLBACK")
+                raise
+            else:
+                await self.conn.execute("COMMIT")
 
     async def fetchone(self, sql: str, params: tuple = ()) -> aiosqlite.Row | None:
         async with self.conn.execute(sql, params) as cur:
@@ -50,6 +56,18 @@ class Database:
     async def fetchall(self, sql: str, params: tuple = ()) -> list[aiosqlite.Row]:
         async with self.conn.execute(sql, params) as cur:
             return list(await cur.fetchall())
+
+    async def kv_get(self, key: str) -> str | None:
+        row = await self.fetchone("SELECT value FROM kv WHERE key=?", (key,))
+        return row["value"] if row else None
+
+
+async def kv_set(conn: aiosqlite.Connection, key: str, value: str) -> None:
+    """Call inside db.tx()."""
+    await conn.execute(
+        "INSERT INTO kv(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
 
 
 # --- Migrations ---------------------------------------------------------------
@@ -111,9 +129,35 @@ async def _m001_initial(conn: aiosqlite.Connection) -> None:
         await conn.execute(stmt)
 
 
+async def _m002_stripe_trial(conn: aiosqlite.Connection) -> None:
+    # The free trial now runs as a Stripe subscription trial (card required),
+    # so we keep Stripe's trial end separately from the old bot-side trial_ends_at.
+    for stmt in [
+        "ALTER TABLE users ADD COLUMN sub_trial_end TEXT",
+        "ALTER TABLE checkout_sessions ADD COLUMN url TEXT",
+        "ALTER TABLE checkout_sessions ADD COLUMN with_trial INTEGER DEFAULT 0",
+        "CREATE INDEX audit_log_user ON audit_log(telegram_id)",
+        "CREATE INDEX checkout_sessions_status ON checkout_sessions(status)",
+    ]:
+        await conn.execute(stmt)
+
+
+async def _m003_past_due_anchor(conn: aiosqlite.Connection) -> None:
+    # Stripe moves a subscription into its next period as soon as it creates the
+    # renewal invoice, paid or not, so for past_due the period end is a month away.
+    # The past-due grace is counted from when the unpaid period began instead.
+    for stmt in [
+        "ALTER TABLE users ADD COLUMN sub_period_start TEXT",
+        "ALTER TABLE users ADD COLUMN past_due_since TEXT",
+    ]:
+        await conn.execute(stmt)
+
+
 # Append new migrations to the end; never edit or reorder old ones.
 MIGRATIONS: list[Callable[[aiosqlite.Connection], Awaitable[None]]] = [
     _m001_initial,
+    _m002_stripe_trial,
+    _m003_past_due_anchor,
 ]
 
 
