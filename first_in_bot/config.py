@@ -118,7 +118,8 @@ def load_config(env: Mapping[str, str]) -> Config:
     if free_link and not _TME_RE.match(free_link):
         problems.append("FREE_CHANNEL_LINK must start with https://t.me/")
 
-    trial_days = integer("TRIAL_DAYS", 14, 1)
+    # Checkout only accepts a fixed trial_end at least 48 hours ahead, so 3 days is the floor.
+    trial_days = integer("TRIAL_DAYS", 14, 3)
     reminder_days = integer("TRIAL_REMINDER_DAYS_BEFORE", 3, 1)
     grace_hours = integer("PAST_DUE_GRACE_HOURS", 72, 0)
     max_removals = integer("MAX_REMOVALS_PER_SWEEP", 5, 1)

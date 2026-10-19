@@ -6,8 +6,8 @@ back as small frozen dataclasses. Each call is logged by name at INFO; the API
 key is never logged. The restricted key only allows: Checkout Sessions write,
 Customers write, Subscriptions read, Customer Portal write, Disputes read and
 reading prices, so don't add calls to other endpoints (no customers.search).
-list_disputes expands each dispute's charge to learn the customer; if Stripe
-rejects that with a permissions error, the key also needs Charges read.
+list_disputes expands each dispute's charge to learn the customer, which
+needs Charges read on the key.
 """
 from __future__ import annotations
 
@@ -231,14 +231,16 @@ class StripeGateway:
         customer_id: str,
         telegram_id: int,
         price_id: str,
-        trial_days: int | None,
+        trial_end: datetime | None,
         success_url: str,
         cancel_url: str,
         idempotency_key: str,
     ) -> CheckoutInfo:
         subscription_data: dict[str, Any] = {"metadata": {"telegram_id": str(telegram_id)}}
-        if trial_days:
-            subscription_data["trial_period_days"] = trial_days
+        if trial_end is not None:
+            # A fixed end, not trial_period_days: the first-charge date shown to the
+            # buyer is then the date Stripe charges, even if they finish checkout later.
+            subscription_data["trial_end"] = int(trial_end.timestamp())
         params: dict[str, Any] = {
             # No ui_mode: the default is the Stripe-hosted page (the values were renamed in 2026).
             "mode": "subscription",

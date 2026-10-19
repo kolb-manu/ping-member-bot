@@ -35,12 +35,16 @@ async def test_trial_checkout_when_eligible(svc, stripe_fake):
     assert offer.kind == "checkout" and offer.with_trial and not offer.reused
     assert offer.url == "https://checkout.stripe.test/cs_1"
     call = stripe_fake.created[0]
-    assert call["trial_days"] == 14 and call["customer_id"] == "cus_1" and call["telegram_id"] == 1
+    trial_end = NOW + timedelta(days=14)          # checkout creation time + TRIAL_DAYS, a fixed moment
+    assert call["trial_end"] == trial_end and offer.trial_end == trial_end
+    assert "trial_days" not in call
+    assert call["customer_id"] == "cus_1" and call["telegram_id"] == 1
     assert call["price_id"] == "price_123"
-    assert call["idempotency_key"] == idempotency_key(1, True, NOW)
+    assert call["idempotency_key"] == idempotency_key(1, True, NOW, trial_end)
     assert call["idempotency_key"].startswith("checkout-1-t-")
     rows = await checkout_rows(svc.db)
     assert len(rows) == 1 and rows[0]["status"] == "open" and rows[0]["with_trial"] == 1
+    assert from_iso(rows[0]["trial_end"]) == trial_end
     assert rows[0]["url"] == offer.url and from_iso(rows[0]["expires_at"]) == NOW + timedelta(hours=24)
     assert (await get_user(svc.db, 1)).stripe_customer_id == "cus_1"
     assert (await get_user(svc.db, 1)).trial_ends_at is None   # no bot-side trial any more
@@ -51,14 +55,14 @@ async def test_no_trial_once_trial_used(svc, stripe_fake):
     user = await add_user(svc.db, 1, trial_started_at=NOW - timedelta(days=30))
     offer = await start_checkout(svc, user, NOW)
     assert not offer.with_trial
-    assert stripe_fake.created[0]["trial_days"] is None
+    assert stripe_fake.created[0]["trial_end"] is None and offer.trial_end is None
     assert "-n-" in stripe_fake.created[0]["idempotency_key"]
 
 
 async def test_no_trial_after_any_subscription(svc, stripe_fake):
     user = await add_user(svc.db, 1, stripe_sub_id="sub_old", sub_status="canceled", stripe_customer_id="cus_1")
     offer = await start_checkout(svc, user, NOW)
-    assert not offer.with_trial and stripe_fake.created[0]["trial_days"] is None
+    assert not offer.with_trial and stripe_fake.created[0]["trial_end"] is None
     assert stripe_fake.customers == []  # existing customer reused
 
 
@@ -444,7 +448,7 @@ async def test_deleted_customer_replaced_and_checkout_retried(svc, stripe_fake):
     user = await get_user(svc.db, 1)
     assert user.stripe_customer_id == "cus_1"
     assert [c["customer_id"] for c in stripe_fake.created] == ["cus_1"]
-    assert stripe_fake.created[0]["idempotency_key"] == idempotency_key(1, True, NOW) + "-cus_1"
+    assert stripe_fake.created[0]["idempotency_key"] == idempotency_key(1, True, NOW, NOW + timedelta(days=14)) + "-cus_1"
     actions = await audit_actions(svc.db, 1)
     assert "stripe_customer_missing" in actions and "checkout_created" in actions
 
@@ -461,3 +465,40 @@ async def test_sync_mid_listing_poll_with_retrieve_keeps_new_sub(svc, stripe_fak
     assert result.ok and stripe_fake.retrieved == ["sub_new"]
     user = await get_user(svc.db, 1)
     assert user.stripe_sub_id == "sub_new" and svc.entitled(user, NOW)
+
+
+# --- the fixed trial_end -----------------------------------------------------------------
+
+def test_trial_end_is_creation_time_plus_trial_days_cut_to_the_minute():
+    from first_in_bot.billing import trial_end_for
+
+    odd = NOW + timedelta(seconds=37)
+    assert trial_end_for(odd, 14) == NOW + timedelta(days=14)
+    assert trial_end_for(NOW, 3) == NOW + timedelta(days=3)
+    assert trial_end_for(odd, 14).tzinfo is not None
+
+
+def test_idempotency_key_differs_when_the_trial_end_differs():
+    a = NOW + timedelta(days=14)
+    assert idempotency_key(1, True, NOW, a) == idempotency_key(1, True, NOW + 30 * timedelta(seconds=1), a)
+    assert idempotency_key(1, True, NOW, a) != idempotency_key(1, True, NOW, a + timedelta(minutes=1))
+
+
+async def test_reused_session_keeps_its_original_trial_end(svc, stripe_fake):
+    user = await add_user(svc.db, 1)
+    first = await start_checkout(svc, user, NOW)
+    later = NOW + timedelta(hours=20)             # still inside the session's 24h life
+    second = await start_checkout(svc, await get_user(svc.db, 1), later)
+    assert second.reused and second.url == first.url
+    assert second.trial_end == first.trial_end == NOW + timedelta(days=14)   # not later + 14 days
+    assert len(stripe_fake.created) == 1
+
+
+async def test_open_trial_session_without_a_stored_trial_end_is_not_reused(svc, stripe_fake):
+    user = await add_user(svc.db, 1)
+    await start_checkout(svc, user, NOW)
+    async with svc.db.tx() as conn:               # as if made before migration 5
+        await conn.execute("UPDATE checkout_sessions SET trial_end=NULL")
+    offer = await start_checkout(svc, await get_user(svc.db, 1), NOW + 20 * M)
+    assert not offer.reused and offer.trial_end == NOW + 20 * M + timedelta(days=14)
+    assert len(stripe_fake.created) == 2

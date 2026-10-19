@@ -2,7 +2,7 @@
 Stripe test clocks to move time forward without waiting.
 
 For each scenario it builds a subscription like the bot's Checkout does (a
-trial_period_days trial, card on file), advances the clock, and after every step
+fixed trial_end of creation time + TRIAL_DAYS, card on file), advances the clock, and after every step
 feeds what Stripe really reports through the bot's own code (parse_subscription,
 write_subscription, is_entitled and the reminder rules). Then it checks the
 result against what the bot is supposed to do:
@@ -303,7 +303,8 @@ class StripeClockDriver:
         sub = await self._call(lambda: v1.subscriptions.create({
             "customer": customer.id,
             "items": [{"price": self.price_id}],
-            "trial_period_days": settings.trial_days,
+            # Like the bot: a fixed trial_end (Checkout needs it 48 hours or more ahead).
+            "trial_end": int((self.t0 + timedelta(days=settings.trial_days)).timestamp()),
             "metadata": {"telegram_id": str(TELEGRAM_ID)},
         }))
         self.sub_id = sub.id

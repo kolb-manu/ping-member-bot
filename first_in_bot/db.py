@@ -170,12 +170,19 @@ async def _m004_disputes(conn: aiosqlite.Connection) -> None:
     )
 
 
+async def _m005_checkout_trial_end(conn: aiosqlite.Connection) -> None:
+    # The fixed trial_end a checkout was created with, so a reused session shows
+    # (and charges on) the same date. NULL for sessions made before this.
+    await conn.execute("ALTER TABLE checkout_sessions ADD COLUMN trial_end TEXT")
+
+
 # Append new migrations to the end; never edit or reorder old ones.
 MIGRATIONS: list[Callable[[aiosqlite.Connection], Awaitable[None]]] = [
     _m001_initial,
     _m002_stripe_trial,
     _m003_past_due_anchor,
     _m004_disputes,
+    _m005_checkout_trial_end,
 ]
 
 

@@ -52,11 +52,13 @@ def contact_line(svc: Services) -> str:
     return texts.CONTACT_SUPPORT.format(support=html.escape(support)) if support else texts.CONTACT_LATER
 
 
-def trial_terms_text(svc: Services, now: datetime) -> str:
-    """The trial facts for someone starting today: the first charge is trial_days from now."""
+def trial_terms_text(svc: Services, now: datetime, trial_end: datetime | None = None) -> str:
+    """The trial facts. With a checkout's own trial_end the date is exact; without one
+    (/terms) it is the date for someone starting today."""
     config = svc.config
-    charge_date = format_local_date(now + timedelta(days=config.trial_days), config.timezone)
-    return texts.trial_terms(svc.price_label, config.trial_days, charge_date)
+    charge = trial_end if trial_end is not None else now + timedelta(days=config.trial_days)
+    return texts.trial_terms(svc.price_label, config.trial_days, format_local_date(charge, config.timezone),
+                             fixed=trial_end is not None)
 
 
 def local_reply(svc: Services, user: User | None) -> Reply | None:
@@ -89,7 +91,8 @@ async def checkout_reply(svc: Services, telegram_id: int, now: datetime, wanted_
         return Reply(texts.DISPUTED_NO_CHECKOUT.format(contact=contact_line(svc)))
     assert offer.url is not None
     if offer.with_trial:
-        body = texts.CHECKOUT_TRIAL.format(terms=trial_terms_text(svc, now))
+        assert offer.trial_end is not None
+        body = texts.CHECKOUT_TRIAL.format(terms=trial_terms_text(svc, now, offer.trial_end))
     else:
         body = texts.CHECKOUT_SUBSCRIBE.format(price=texts.price_text(svc.price_label))
     if wanted_trial and not offer.with_trial:

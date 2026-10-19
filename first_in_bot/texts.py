@@ -14,17 +14,28 @@ def price_text(label: str | None) -> str:
 
 # The trial facts, worded once and shown before the Stripe link, in "How it works"
 # and in /terms. {price} already includes the interval (e.g. "£2.99/month").
-TRIAL_TERMS = (
+# With a checkout in hand the first-charge date is fixed (it is the trial_end baked into
+# the Stripe session); in "How it works" and /terms there is no session yet, so the date
+# is "if you start today".
+TRIAL_TERMS_FIXED = (
     "• <b>{days} days free</b>, then <b>{price}</b>, charged automatically.\n"
     "• A card is required to start. You add it on Stripe's secure checkout page.\n"
-    "• The {days} days start when you add your card. If you start today, your first payment "
+    "• Your first payment is taken on <b>{charge_date}</b>. That date is fixed when this link is made, "
+    "so it stays the same even if you finish checkout later.\n"
+    "• Cancel any time before then with /manage and you won't be charged."
+)
+TRIAL_TERMS_GENERIC = (
+    "• <b>{days} days free</b>, then <b>{price}</b>, charged automatically.\n"
+    "• A card is required to start. You add it on Stripe's secure checkout page.\n"
+    "• The {days} days count from when you tap the button. If you start today, your first payment "
     "is taken on <b>{charge_date}</b>.\n"
     "• Cancel any time before then with /manage and you won't be charged."
 )
 
 
-def trial_terms(price_label: str | None, days: int, charge_date: str) -> str:
-    return TRIAL_TERMS.format(price=price_text(price_label), days=days, charge_date=charge_date)
+def trial_terms(price_label: str | None, days: int, charge_date: str, fixed: bool = False) -> str:
+    template = TRIAL_TERMS_FIXED if fixed else TRIAL_TERMS_GENERIC
+    return template.format(price=price_text(price_label), days=days, charge_date=charge_date)
 
 
 # --- Welcome ---------------------------------------------------------------

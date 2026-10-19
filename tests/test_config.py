@@ -44,6 +44,7 @@ def test_missing_values_all_reported_at_once():
     ("PAID_JOIN_REQUEST_LINK", "http://example.com"),
     ("FREE_CHANNEL_LINK", "t.me/x"),
     ("TRIAL_DAYS", "0"),
+    ("TRIAL_DAYS", "2"),      # Stripe Checkout needs trial_end at least 48 hours ahead
     ("REMOVALS_ENABLED", "maybe"),
     ("TIMEZONE", "Mars/Olympus"),
     ("STRIPE_PRICE_ID", "prod_123"),

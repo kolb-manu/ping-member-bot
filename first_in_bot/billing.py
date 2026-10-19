@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from . import texts
 from .audit import audit, audit_if_changed
@@ -46,6 +46,7 @@ class CheckoutOffer:
     url: str | None = None
     with_trial: bool = False
     reused: bool = False
+    trial_end: datetime | None = None   # the fixed first-charge moment baked into the session
 
 
 @dataclass
@@ -66,9 +67,18 @@ class SyncResult:
     ok: bool = True
 
 
-def idempotency_key(telegram_id: int, with_trial: bool, now: datetime) -> str:
+def trial_end_for(now: datetime, days: int) -> datetime:
+    """Checkout creation time + the trial length, cut to the minute so that taps within
+    the same minute send identical parameters (Stripe rejects a reused idempotency key
+    whose parameters differ)."""
+    ts = int((now + timedelta(days=days)).timestamp())
+    return datetime.fromtimestamp(ts - ts % 60, tz=timezone.utc)
+
+
+def idempotency_key(telegram_id: int, with_trial: bool, now: datetime, trial_end: datetime | None = None) -> str:
     bucket = int(now.timestamp()) // IDEMPOTENCY_BUCKET_SECONDS
-    return f"checkout-{telegram_id}-{'t' if with_trial else 'n'}-{bucket}"
+    key = f"checkout-{telegram_id}-{'t' if with_trial else 'n'}-{bucket}"
+    return f"{key}-{int(trial_end.timestamp())}" if trial_end is not None else key
 
 
 # --- Starting a checkout --------------------------------------------------------
@@ -88,47 +98,53 @@ async def start_checkout(svc: Services, user: User, now: datetime) -> CheckoutOf
 
     with_trial = trial_eligible(user)
     row = await svc.db.fetchone(
-        "SELECT id, url, with_trial FROM checkout_sessions "
+        "SELECT id, url, with_trial, trial_end FROM checkout_sessions "
         "WHERE telegram_id=? AND status='open' AND expires_at>? AND url IS NOT NULL "
         "ORDER BY created_at DESC LIMIT 1",
         (user.telegram_id, to_iso(now + CHECKOUT_REUSE_MARGIN)),
     )
-    if row is not None and bool(row["with_trial"]) == with_trial:
+    # A trial session is only reusable if we know its fixed trial_end (older ones don't):
+    # the date we show must be the date it charges.
+    if row is not None and bool(row["with_trial"]) == with_trial and (not with_trial or row["trial_end"]):
         log.info("Reusing open checkout %s for %s", row["id"], user.telegram_id)
-        return CheckoutOffer("checkout", url=row["url"], with_trial=with_trial, reused=True)
+        return CheckoutOffer("checkout", url=row["url"], with_trial=with_trial, reused=True,
+                             trial_end=from_iso(row["trial_end"]))
 
     customer_id = await _get_or_create_customer(svc, user, now)
-    key = idempotency_key(user.telegram_id, with_trial, now)
+    trial_end = trial_end_for(now, svc.config.trial_days) if with_trial else None
+    key = idempotency_key(user.telegram_id, with_trial, now, trial_end)
     try:
-        info = await _create_checkout(svc, user.telegram_id, customer_id, with_trial, key)
+        info = await _create_checkout(svc, user.telegram_id, customer_id, trial_end, key)
     except CustomerMissing:
         # Deleted at Stripe (e.g. test data reset): make a new customer and try once more,
         # with a new key, because the old one would replay the failed request.
         customer_id = await replace_missing_customer(svc, user.telegram_id, customer_id, now)
-        info = await _create_checkout(svc, user.telegram_id, customer_id, with_trial, f"{key}-{customer_id}")
+        info = await _create_checkout(svc, user.telegram_id, customer_id, trial_end, f"{key}-{customer_id}")
     if not info.url:
         raise StripeGatewayError("Stripe returned a checkout session without a URL")
     async with svc.db.tx() as conn:
         # OR IGNORE: a double tap inside the idempotency window returns the same session.
         cur = await conn.execute(
-            "INSERT OR IGNORE INTO checkout_sessions(id, telegram_id, created_at, expires_at, status, url, with_trial) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (info.id, user.telegram_id, to_iso(now), to_iso(info.expires_at), "open", info.url, int(with_trial)),
+            "INSERT OR IGNORE INTO checkout_sessions(id, telegram_id, created_at, expires_at, status, url, with_trial, "
+            "trial_end) VALUES(?,?,?,?,?,?,?,?)",
+            (info.id, user.telegram_id, to_iso(now), to_iso(info.expires_at), "open", info.url, int(with_trial),
+             to_iso(trial_end) if trial_end else None),
         )
         if cur.rowcount == 1:
             await audit(conn, now, user.telegram_id, "checkout_created",
-                        f"{info.id} trial={'yes' if with_trial else 'no'}")
-    return CheckoutOffer("checkout", url=info.url, with_trial=with_trial)
+                        f"{info.id} trial={'yes' if with_trial else 'no'}"
+                        + (f" trial_end={to_iso(trial_end)}" if trial_end else ""))
+    return CheckoutOffer("checkout", url=info.url, with_trial=with_trial, trial_end=trial_end)
 
 
-async def _create_checkout(svc: Services, telegram_id: int, customer_id: str, with_trial: bool,
+async def _create_checkout(svc: Services, telegram_id: int, customer_id: str, trial_end: datetime | None,
                            key: str) -> CheckoutInfo:
     assert svc.stripe is not None
     return await svc.stripe.create_checkout(
         customer_id=customer_id,
         telegram_id=telegram_id,
         price_id=svc.config.stripe_price_id,
-        trial_days=svc.config.trial_days if with_trial else None,
+        trial_end=trial_end,
         success_url=svc.config.stripe_success_url,
         cancel_url=svc.config.stripe_cancel_url,
         idempotency_key=key,

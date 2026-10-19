@@ -128,11 +128,12 @@ async def test_trial_button_sends_checkout_link(svc, tg, stripe_fake):
     assert "14 days free" in text and "£2.99/month" in text
     assert "A card is required" in text
     assert "first payment is taken on <b>15 Nov 2026</b>" in text
+    assert "fixed when this link is made" in text
     assert "Cancel any time before then with /manage" in text
     url_button, done_button = buttons(tg.markups_to(1)[0])
     assert url_button.url == "https://checkout.stripe.test/cs_1"
     assert done_button.callback_data == "paid:check" and done_button.text == "I've added my card"
-    assert stripe_fake.created[0]["trial_days"] == 14
+    assert stripe_fake.created[0]["trial_end"] == NOW + 14 * D
 
 
 async def test_old_trial_button_after_trial_used(svc, tg, stripe_fake):
@@ -140,7 +141,7 @@ async def test_old_trial_button_after_trial_used(svc, tg, stripe_fake):
     await billing_handlers.on_checkout_button(FakeCallback(1, "trial:start"), svc)
     text = tg.sent_to(1)[0]
     assert text.startswith(texts.ALREADY_HAD_TRIAL) and "subscribe for £2.99/month" in text
-    assert stripe_fake.created[0]["trial_days"] is None
+    assert stripe_fake.created[0]["trial_end"] is None
     assert buttons(tg.markups_to(1)[0])[1].text == "I've paid"
 
 
@@ -401,3 +402,14 @@ async def test_cancelled_trial_status_says_access_until_trial_end(svc):
     reply = await billing_handlers.status_reply(svc, 1, NOW)
     assert "You've cancelled" in reply.text and "won't be charged" in reply.text
     assert texts.STATUS_ACCESS_YES in reply.text
+
+
+async def test_resent_link_shows_the_original_first_charge_date(svc, tg, stripe_fake):
+    """Same session reused 20 hours later: the message must still show the date Stripe will charge."""
+    await add_user(svc.db, 1)
+    first = await billing_handlers.checkout_reply(svc, 1, NOW)
+    second = await billing_handlers.checkout_reply(svc, 1, NOW + timedelta(hours=20))
+    assert "<b>15 Nov 2026</b>" in first.text and "<b>15 Nov 2026</b>" in second.text
+    assert "16 Nov 2026" not in second.text
+    assert first.markup.inline_keyboard[0][0].url == second.markup.inline_keyboard[0][0].url
+    assert len(stripe_fake.created) == 1
