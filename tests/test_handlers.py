@@ -460,3 +460,43 @@ async def test_resent_link_shows_the_original_first_charge_date(svc, tg, stripe_
     assert "16 Nov 2026" not in second.text
     assert first.markup.inline_keyboard[0][0].url == second.markup.inline_keyboard[0][0].url
     assert len(stripe_fake.created) == 1
+
+
+# --- the price read later, and "How it works" from an old message ---------------------------
+
+async def test_no_stripe_link_while_the_price_is_unknown(svc, tg, stripe_fake):
+    from first_in_bot.handlers.start import on_start
+
+    await add_user(svc.db, 1)
+    svc.price.label = None   # Stripe couldn't be read at startup
+    for data in ("trial:start", "subscribe"):
+        cb = FakeCallback(1, data)
+        await billing_handlers.on_checkout_button(cb, svc)
+        assert cb.answers == [("Opening checkout…", False)]
+    msg = FakeMessage(1)
+    await billing_handlers.cmd_subscribe(msg, svc)
+    assert tg.sent_to(1) == [billing_handlers.PRICE_UNKNOWN] * 2 and tg.markups_to(1) == [None, None]
+    assert msg.answers == [(billing_handlers.PRICE_UNKNOWN, None)]
+    assert stripe_fake.created == []
+
+    # Read later (billing.refresh_price): every handler sees it at once, no restart.
+    svc.price.label = "£3.49/month"
+    await billing_handlers.on_checkout_button(FakeCallback(1, "trial:start"), svc)
+    assert "then <b>£3.49/month</b>" in tg.sent_to(1)[-1]
+    start = FakeMessage(1)
+    await on_start(start, cmd("start"), svc)
+    assert "then £3.49/month" in start.answers[0][0]
+
+
+async def test_how_it_works_answers_even_from_an_old_or_deleted_message(svc, tg):
+    from aiogram.types import Chat, InaccessibleMessage
+
+    from first_in_bot.handlers.start import on_how
+
+    await add_user(svc.db, 1)
+    # Days old, after a restart: the welcome is inaccessible and the press too old to answer.
+    cb = FakeCallback(1, "how", too_old=True)
+    cb.message = InaccessibleMessage(chat=Chat(id=1, type="private"), message_id=5)
+    await on_how(cb, svc)
+    [text] = tg.sent_to(1)
+    assert "14 days free" in text and "£2.99/month" in text and "A card is required" in text

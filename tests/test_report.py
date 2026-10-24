@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from first_in_bot.billing import LAST_FULL_SYNC_KEY
+from first_in_bot.daily import SKIPPED
 from first_in_bot.db import kv_set
 from first_in_bot.report import REPORT_DATE_KEY, daily_report_job, report_text
 from first_in_bot.scheduler import JobHealth, JobHealthStore
@@ -95,23 +96,31 @@ async def test_removals_on(db, tg, stripe_fake):
     assert "Removals: on" in await report_text(make_svc(db, tg, stripe_fake, REMOVALS_ENABLED="true"), MORNING, {})
 
 
+async def test_the_price_and_a_warning_while_it_is_unknown(svc):
+    assert "Stripe: TEST mode, £2.99/month" in await report_text(svc, MORNING, {})
+    svc.price.label = None   # couldn't be read from Stripe
+    text = await report_text(svc, MORNING, {})
+    assert "⚠️ Couldn't read the price from Stripe" in text and "£2.99" not in text
+
+
 # --- the job ------------------------------------------------------------------------------
 
 async def test_sent_once_a_day_from_nine_london(svc, tg):
     source = FakeHealth()
-    assert not await daily_report_job(svc, MORNING - M, source)
+    # Not due: SKIPPED, so the scheduler counts it as neither working nor failing.
+    assert await daily_report_job(svc, MORNING - M, source) is SKIPPED
     assert tg.sent_to(OWNER) == []
-    assert await daily_report_job(svc, MORNING, source)
-    assert not await daily_report_job(svc, MORNING + M, source)
+    assert await daily_report_job(svc, MORNING, source) is True
+    assert await daily_report_job(svc, MORNING + M, source) is SKIPPED
     assert len(tg.sent_to(OWNER)) == 1 and await svc.db.kv_get(REPORT_DATE_KEY) == "2026-11-02"
-    assert await daily_report_job(svc, MORNING + timedelta(days=1), source)
+    assert await daily_report_job(svc, MORNING + timedelta(days=1), source) is True
     assert len(tg.sent_to(OWNER)) == 2
 
 
 async def test_in_summer_it_goes_at_eight_utc(svc, tg):
     source = FakeHealth()
-    assert not await daily_report_job(svc, datetime(2026, 7, 1, 7, 59, tzinfo=timezone.utc), source)
-    assert await daily_report_job(svc, datetime(2026, 7, 1, 8, 0, tzinfo=timezone.utc), source)
+    assert await daily_report_job(svc, datetime(2026, 7, 1, 7, 59, tzinfo=timezone.utc), source) is SKIPPED
+    assert await daily_report_job(svc, datetime(2026, 7, 1, 8, 0, tzinfo=timezone.utc), source) is True
 
 
 async def test_a_restart_later_the_same_day_catches_up(svc, tg):
@@ -122,7 +131,8 @@ async def test_network_failure_retried_next_minute_and_counters_kept(svc, tg):
     store = JobHealthStore(svc.db)
     await store.update("sync_subscriptions", lambda h: h.failed(MORNING - H, "RuntimeError: x"))
     tg.send_results[OWNER] = SendResult.FAILED
-    assert not await daily_report_job(svc, MORNING, store)
+    # Telegram couldn't be reached: retried next minute, and no verdict on the job.
+    assert await daily_report_job(svc, MORNING, store) is SKIPPED
     assert await svc.db.kv_get(REPORT_DATE_KEY) is None
     assert (await store.get("sync_subscriptions")).failures_since_report == 1
 
@@ -138,8 +148,8 @@ async def test_blocked_or_rejected_is_not_retried_every_minute(svc, tg, result):
     store = JobHealthStore(svc.db)
     await store.update("send_notices", lambda h: h.failed(MORNING - H, "x"))
     tg.send_results[OWNER] = result
-    assert not await daily_report_job(svc, MORNING, store)
-    assert not await daily_report_job(svc, MORNING + M, store)
+    assert await daily_report_job(svc, MORNING, store) is False
+    assert await daily_report_job(svc, MORNING + M, store) is SKIPPED
     assert len(tg.sent_to(OWNER)) == 1 and await svc.db.kv_get(REPORT_DATE_KEY) == "2026-11-02"
     assert (await store.get("send_notices")).failures_since_report == 1   # the owner never saw them
 

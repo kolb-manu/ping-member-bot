@@ -8,13 +8,26 @@ the same day, and a restart after the work was done never repeats it.
 The check compares local wall-clock time, so it holds across clock changes: on the
 day the clocks go forward a time that doesn't exist (01:30 in London) is due at
 02:00, and on the day they go back a time that happens twice is due only once.
+
+A tick that finds nothing to do returns SKIPPED, which the scheduler records as
+neither a success nor a failure. Otherwise a job that is failing (and so retried
+later) would look as if it had recovered on every quiet tick in between.
 """
 from __future__ import annotations
 
+import enum
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from .db import Database, kv_set
+
+
+class Skipped(enum.Enum):
+    # Here rather than in scheduler.py, which imports the jobs that return it.
+    SKIPPED = "skipped"
+
+
+SKIPPED = Skipped.SKIPPED
 
 
 def daily_due(now_utc: datetime, tz: ZoneInfo, at: time, last_done: str | None) -> tuple[bool, str]:

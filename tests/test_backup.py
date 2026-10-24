@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shutil
 import sqlite3
 import stat
 from datetime import date, datetime, timedelta, timezone
@@ -55,15 +56,24 @@ async def test_backup_of_a_wal_file_database_is_one_self_contained_file(tmp_path
     assert sorted(p.name for p in path.parent.iterdir()) == ["first-in-2026-11-01.db"]
 
 
-async def test_same_day_overwrites_that_days_file(db, tmp_path):
-    backups = str(tmp_path / "backups")
+async def test_same_day_never_overwrites_that_days_file(db, tmp_path):
+    # After a restore the bot backs up again the same day (the restored database
+    # brings back an older last_backup_date). That copy must not replace the nightly.
+    backups = tmp_path / "backups"
     await add_user(db, 501)
-    first = await backup_database(db, backups, DAY)
+    first = await backup_database(db, str(backups), DAY)
     await add_user(db, 502)
-    second = await backup_database(db, backups, DAY)
-    assert first == second
+    second = await backup_database(db, str(backups), DAY)
+    third = await backup_database(db, str(backups), DAY)
+    assert [first.name, second.name, third.name] == [
+        "first-in-2026-11-01.db", "first-in-2026-11-01-2.db", "first-in-2026-11-01-3.db"]
+    assert rows(first, "SELECT telegram_id FROM users ORDER BY telegram_id") == [(501,)]
     assert rows(second, "SELECT telegram_id FROM users ORDER BY telegram_id") == [(501,), (502,)]
-    assert len(list(Path(backups).iterdir())) == 1
+    assert sorted(p.name for p in backups.iterdir()) == sorted([first.name, second.name, third.name])
+    assert mode(second) == 0o600
+    # Numbers keep the order they were made in, even with one deleted by hand.
+    first.unlink()
+    assert (await backup_database(db, str(backups), DAY)).name == "first-in-2026-11-01-4.db"
 
 
 async def test_backup_file_and_new_folder_are_private(db, tmp_path):
@@ -186,10 +196,29 @@ def test_prune_counts_dates_not_neighbours(tmp_path):
     ]
 
 
+def test_prune_counts_same_day_backups_newest_number_last(tmp_path):
+    # -N files are the later backups of their day, so 11-01-2 is newer than 11-01
+    # and older than 11-02, whatever the modification times say.
+    names = ["first-in-2026-10-31.db", "first-in-2026-11-01.db", "first-in-2026-11-01-2.db",
+             "first-in-2026-11-01-10.db", "first-in-2026-11-02.db"]
+    for i, name in enumerate(reversed(names)):
+        (tmp_path / name).write_bytes(b"x")
+        os.utime(tmp_path / name, (1_000_000 + i, 1_000_000 + i))
+    assert prune_backups(str(tmp_path), keep=3) == [
+        tmp_path / "first-in-2026-10-31.db", tmp_path / "first-in-2026-11-01.db"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "first-in-2026-11-01-10.db", "first-in-2026-11-01-2.db", "first-in-2026-11-02.db"]
+
+
 def test_prune_never_touches_other_files(tmp_path):
     make_backups(tmp_path, [DAY, DAY - timedelta(days=1)])
     others = [
         "notes.txt",
+        "before-restore.db",
+        "first-in-2020-01-01-1.db",    # the bot never writes -1 ...
+        "first-in-2020-01-01-02.db",   # ... or a leading zero
+        "first-in-2020-01-01-x.db",
+        "first-in-2020-01-01-2.db.bak",
         "first-in-2020-01-01.db.bak",
         "first-in-2020-01-01.db-wal",
         "old-first-in-2020-01-01.db",
@@ -231,6 +260,7 @@ def test_prune_refuses_to_keep_nothing(tmp_path):
 # --- the nightly job ---------------------------------------------------------------
 
 from first_in_bot.backup import BACKUP_DATE_KEY, BACKUP_FAILED_KEY, RETRY_AFTER, nightly_backup  # noqa: E402
+from first_in_bot.daily import SKIPPED  # noqa: E402
 from tests.fakes import NOW, FakeTelegram, make_svc  # noqa: E402
 
 NIGHT = datetime(2026, 11, 2, 3, 30, tzinfo=timezone.utc)   # 03:30 GMT = 03:30 London in November
@@ -243,12 +273,12 @@ def _svc(db, folder, **overrides):
 async def test_nightly_backup_runs_once_a_day_at_half_three(db, tmp_path):
     svc = _svc(db, tmp_path / "b")
     await add_user(db, 1)
-    assert await nightly_backup(svc, NIGHT - timedelta(minutes=1)) is None
+    assert await nightly_backup(svc, NIGHT - timedelta(minutes=1)) is SKIPPED
     path = await nightly_backup(svc, NIGHT)
     assert path == tmp_path / "b" / "first-in-2026-11-02.db"
     assert await db.kv_get(BACKUP_DATE_KEY) == "2026-11-02"
     # Done for today: later ticks (and restarts) don't repeat it.
-    assert await nightly_backup(svc, NIGHT + timedelta(hours=5)) is None
+    assert await nightly_backup(svc, NIGHT + timedelta(hours=5)) is SKIPPED
     conn = sqlite3.connect(path)
     assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
     conn.close()
@@ -263,9 +293,9 @@ async def test_nightly_backup_catches_up_after_downtime(db, tmp_path):
 async def test_nightly_backup_uses_the_local_date_in_summer(db, tmp_path):
     # 23:45 UTC on 24 Oct is 00:45 London (BST), so not yet due on the 25th...
     svc = _svc(db, tmp_path / "b")
-    assert await nightly_backup(svc, datetime(2026, 10, 24, 23, 45, tzinfo=timezone.utc)) is None
+    assert await nightly_backup(svc, datetime(2026, 10, 24, 23, 45, tzinfo=timezone.utc)) is SKIPPED
     # ...and 02:30 UTC on the 25th (after the clocks went back) is 02:30 GMT: still not 03:30.
-    assert await nightly_backup(svc, datetime(2026, 10, 25, 2, 30, tzinfo=timezone.utc)) is None
+    assert await nightly_backup(svc, datetime(2026, 10, 25, 2, 30, tzinfo=timezone.utc)) is SKIPPED
     path = await nightly_backup(svc, datetime(2026, 10, 25, 3, 30, tzinfo=timezone.utc))
     assert path.name == "first-in-2026-10-25.db"
 
@@ -291,7 +321,7 @@ async def test_failed_backup_raises_and_is_retried_every_half_hour(db, tmp_path)
     assert await db.kv_get(BACKUP_DATE_KEY) is None
     assert await db.kv_get(BACKUP_FAILED_KEY) is not None
     # The job ticks every minute, but a failing backup isn't hammered.
-    assert await nightly_backup(svc, NIGHT + timedelta(minutes=1)) is None
+    assert await nightly_backup(svc, NIGHT + timedelta(minutes=1)) is SKIPPED
     with pytest.raises(BackupError):
         await nightly_backup(svc, NIGHT + RETRY_AFTER)
     # Once it works again the failure mark goes.
@@ -299,3 +329,31 @@ async def test_failed_backup_raises_and_is_retried_every_half_hour(db, tmp_path)
     good = _svc(db, blocker)
     assert await nightly_backup(good, NIGHT + 2 * RETRY_AFTER) is not None
     assert await db.kv_get(BACKUP_FAILED_KEY) is None
+
+
+async def test_backup_after_a_restore_keeps_the_real_nightly(tmp_path):
+    """The restore flow in DEPLOY.md: the nightly copies don't know they were
+    backed up, so the restored database is due again the same day. Its copy goes
+    to -2, and the nightly made from the data before the restore stays."""
+    folder = tmp_path / "b"
+    live = await Database.open(str(tmp_path / "data" / "first-in.db"))
+    try:
+        await add_user(live, 1)
+        older = await nightly_backup(_svc(live, folder), NIGHT - timedelta(days=1))
+        await add_user(live, 2)
+        await add_user(live, 3)
+        nightly = await nightly_backup(_svc(live, folder), NIGHT)
+    finally:
+        await live.close()
+    # The owner copies 1 Nov's backup into place and starts the bot again.
+    (tmp_path / "restored").mkdir()
+    shutil.copy(older, tmp_path / "restored" / "first-in.db")
+    restored = await Database.open(str(tmp_path / "restored" / "first-in.db"))
+    try:
+        midday = NIGHT.replace(hour=12, minute=30)
+        again = await nightly_backup(_svc(restored, folder), midday)
+    finally:
+        await restored.close()
+    assert again.name == "first-in-2026-11-02-2.db"
+    assert rows(nightly, "SELECT telegram_id FROM users ORDER BY telegram_id") == [(1,), (2,), (3,)]
+    assert rows(again, "SELECT telegram_id FROM users") == [(1,)]

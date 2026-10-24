@@ -1,5 +1,6 @@
 """Stripe billing: starting a checkout (with the free trial when eligible),
-detecting payment by polling (no webhooks in v1), and the full subscription sync.
+detecting payment by polling (no webhooks in v1), the full subscription sync, and
+reading the price that every message shows.
 
 The free trial is a Stripe subscription trial with a card required (owner
 decision 2026-10-18), so users.trial_ends_at is never set here. Access still
@@ -7,6 +8,7 @@ comes only from is_entitled, which treats sub_status trialing/active as entitled
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import logging
@@ -16,13 +18,22 @@ from datetime import datetime, timedelta, timezone
 from . import texts
 from .alerts import alert_owner
 from .audit import audit, audit_if_changed
+from .daily import SKIPPED, Skipped
 from .db import Database, kv_set
 from .entitlement import DISPUTED_STATUS, ENTITLED_SUB_STATUSES
 from .keyboards import join_channel_keyboard
 from .models import User
 from .notices import NoticeOutcome, deliver_notice
 from .services import Services
-from .stripe_gateway import CheckoutInfo, CustomerMissing, StripeGatewayError, SubInfo, SubscriptionMissing
+from .stripe_gateway import (
+    CheckoutInfo,
+    CheckoutMissing,
+    CustomerMissing,
+    StripeGateway,
+    StripeGatewayError,
+    SubInfo,
+    SubscriptionMissing,
+)
 from .timeutil import format_local, from_iso, to_iso
 from .users import get_user, trial_eligible
 
@@ -43,11 +54,16 @@ MISSING_STATUS = "missing"
 SYNC_RACE_MARGIN = timedelta(seconds=120)
 ALERT_LIST_LIMIT = 20
 DUPLICATE_REMINDER = timedelta(hours=24)
+# Stripe statuses where the subscription is still there to fix (pay the open invoice
+# in the portal), so selling another one would only make a duplicate.
+FIX_PAYMENT_STATUSES = frozenset({"past_due", "unpaid"})
+# Reading the price at startup: the pause before each retry, in seconds.
+PRICE_RETRY_DELAYS = (2.0, 5.0)
 
 
 @dataclass(frozen=True)
 class CheckoutOffer:
-    kind: str                 # "checkout" | "already_in" | "fix_payment" | "disputed"
+    kind: str                 # "checkout" | "already_in" | "fix_payment" | "disputed" | "price_unknown"
     url: str | None = None
     with_trial: bool = False
     reused: bool = False
@@ -60,6 +76,12 @@ class PollResult:
     completed: int = 0
     expired: int = 0
     errors: int = 0
+
+    @property
+    def ok(self) -> bool:
+        # A session Stripe couldn't be asked about may be a payment nobody has seen
+        # yet, so the scheduler counts the run as failed and alerts if it keeps up.
+        return self.errors == 0
 
 
 @dataclass
@@ -96,10 +118,14 @@ async def start_checkout(svc: Services, user: User, now: datetime) -> CheckoutOf
     # someone who already has a live one.
     if user.sub_status in ENTITLED_SUB_STATUSES:
         return CheckoutOffer("already_in")
-    if user.sub_status == "past_due":
+    if user.sub_status in FIX_PAYMENT_STATUSES:
         return CheckoutOffer("fix_payment")
     if user.sub_status == DISPUTED_STATUS:
         return CheckoutOffer("disputed")
+    if svc.price_label is None:
+        # Never a Stripe link without the price and interval in front of it
+        # (CLAUDE.md). refresh_price reads it again every few minutes.
+        return CheckoutOffer("price_unknown")
 
     with_trial = trial_eligible(user)
     row = await svc.db.fetchone(
@@ -332,6 +358,13 @@ async def poll_checkouts(svc: Services, now: datetime, only_telegram_id: int | N
         result.checked += 1
         try:
             info = await svc.stripe.get_checkout(row["id"])
+        except CheckoutMissing:
+            # Stripe has no such session (test data deleted, or another account's
+            # key), so it can never be paid. Not an error worth retrying.
+            await _set_checkout_status(svc.db, row["id"], row["telegram_id"], "expired", now,
+                                       "no longer at Stripe")
+            result.expired += 1
+            continue
         except StripeGatewayError:
             result.errors += 1
             expires_at = from_iso(row["expires_at"])
@@ -448,15 +481,20 @@ async def sync_subscriptions(svc: Services, now: datetime) -> SyncResult:
         groups.setdefault(row["telegram_id"], []).append(sub)
 
     duplicates: list[str] = []
+    duplicate_ids: list[str] = []
     for telegram_id, user_subs in groups.items():
         try:
-            live = sorted(s.id for s in user_subs if s.status not in TERMINAL_STATUSES)
+            live = sorted((s for s in user_subs if s.status not in TERMINAL_STATUSES), key=lambda s: s.id)
             if len(live) > 1:
-                log.warning("User %s has %d live subscriptions: %s", telegram_id, len(live), ", ".join(live))
+                ids = [s.id for s in live]
+                # With the status next to each id the owner can tell which one to cancel.
+                listed = ", ".join(f"{s.id} ({s.status})" for s in live)
+                log.warning("User %s has %d live subscriptions: %s", telegram_id, len(live), listed)
                 result.multiple.append(telegram_id)
-                duplicates.append(f"user {telegram_id}: {', '.join(live)}")
+                duplicates.append(f"user {telegram_id}: {listed}")
+                duplicate_ids.append(f"user {telegram_id}: {', '.join(ids)}")
                 async with svc.db.tx() as conn:
-                    await audit_if_changed(conn, now, telegram_id, "multiple_subs", " ".join(live))
+                    await audit_if_changed(conn, now, telegram_id, "multiple_subs", " ".join(ids))
             # `now` was taken before the listing, so it is when this snapshot started.
             if await write_subscription(svc.db, telegram_id, pick_best(user_subs), now, sync_started=now,
                                         snapshot_ids=frozenset(s.id for s in user_subs)):
@@ -475,10 +513,10 @@ async def sync_subscriptions(svc: Services, now: datetime) -> SyncResult:
              result.subscriptions, result.users_updated, result.skipped, result.unmatched, result.ok)
     # One alert per kind for the whole sync, after it: alert_owner never raises, so a
     # failed DM can't fail the sync. Duplicates are keyed by exactly who and which
-    # subscriptions, so a new one is alerted at once, while ones nobody has sorted
-    # out yet are a daily reminder rather than one every 30 minutes.
+    # subscriptions (not their statuses), so a new one is alerted at once, while ones
+    # nobody has sorted out yet are a daily reminder rather than one every 30 minutes.
     if duplicates:
-        key = hashlib.sha256("\n".join(duplicates).encode()).hexdigest()[:12]
+        key = hashlib.sha256("\n".join(duplicate_ids).encode()).hexdigest()[:12]
         await alert_owner(svc, f"multiple_subs:{key}", "\n".join([
             "⚠️ <b>More than one live subscription</b>",
             _alert_list(duplicates),
@@ -514,3 +552,33 @@ async def _mark_sub_missing(db: Database, telegram_id: int, sub_id: str, now: da
         log.warning("Subscription %s of %s no longer exists at Stripe; marked missing", sub_id, telegram_id)
         await audit(conn, now, telegram_id, "sub_missing", sub_id)
     return True
+
+
+# --- The price ----------------------------------------------------------------------
+
+async def read_price(stripe: StripeGateway, price_id: str, *, sleep=asyncio.sleep) -> str | None:
+    """The price label ("£2.99/month") at startup, with a few quick retries, as a
+    blip while the machine boots shouldn't hold back checkouts. None if it still
+    couldn't be read; refresh_price then keeps trying."""
+    for delay in (0.0, *PRICE_RETRY_DELAYS):
+        if delay:
+            await sleep(delay)
+        label = await stripe.price_label(price_id)
+        if label is not None:
+            return label
+    return None
+
+
+async def refresh_price(svc: Services) -> str | Skipped:
+    """Scheduler job: while the price is unknown, read it from Stripe again.
+    Raises while it still can't be read, so a lasting problem reaches the owner;
+    SKIPPED once the price is known."""
+    if svc.stripe is None or svc.price_label is not None:
+        return SKIPPED
+    label = await svc.stripe.price_label(svc.config.stripe_price_id)
+    if label is None:
+        raise StripeGatewayError(f"couldn't read the price {svc.config.stripe_price_id} from Stripe, "
+                                 "so trial and subscribe checkouts are held back")
+    svc.price.label = label
+    log.warning("Read the Stripe price: %s. Trial and subscribe checkouts are open again.", label)
+    return label

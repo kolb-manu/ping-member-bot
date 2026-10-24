@@ -4,8 +4,11 @@ No per-user timers: every job re-reads the DB on each tick, so a restart loses
 nothing. One lock per job means a run never overlaps the previous one, and each
 run is wrapped so an exception is logged and the loop carries on next tick.
 
-A run fails if it raises or returns a result whose .ok is False (the Stripe sync
-and the disputes check report partial failures that way). Each job's health
+A run fails if it raises or returns a result whose .ok is False (the Stripe sync,
+the checkout poll and the disputes check report partial failures that way). A run
+that returns daily.SKIPPED had nothing to do (not due yet, or waiting to retry) and
+is recorded as neither. A job with a retry_interval is tried again that much
+sooner after a failure than its usual interval. Each job's health
 (failures in a row, failures since the last daily report, the last error) is kept
 in kv so the daily report survives restarts. After alert_after failures in a row
 the owner gets a rate-limited alert, and one "working again" DM once it recovers.
@@ -27,7 +30,8 @@ import aiosqlite
 
 from .alerts import alert_owner, send_owner, short_error
 from .backup import nightly_backup
-from .billing import poll_checkouts, sync_subscriptions
+from .billing import poll_checkouts, refresh_price, sync_subscriptions
+from .daily import SKIPPED, Skipped
 from .db import Database, kv_set
 from .disputes import check_disputes
 from .notices import send_notices
@@ -41,7 +45,8 @@ log = logging.getLogger(__name__)
 
 HEALTH_KEY_PREFIX = "job_health:"
 # systemd is given TimeoutStopSec=45 before it kills the process; this leaves room
-# for closing the bot session and the DB after the jobs.
+# for closing the bot session and the DB after the jobs. (main.py waits for updates
+# still being handled at the same time, for less, so that adds nothing.)
 STOP_TIMEOUT = 25.0
 # Extra lines for failures whose effect on members the owner should know about.
 FAILURE_NOTES = {
@@ -57,6 +62,7 @@ class Job:
     run: Callable[[], Awaitable[Any]]
     initial_delay: float = 0.0
     alert_after: int = 1               # failures in a row before the owner is alerted
+    retry_interval: float | None = None  # after a failed run, wait this instead of interval
 
 
 def build_jobs(svc: Services) -> list[Job]:
@@ -68,7 +74,12 @@ def build_jobs(svc: Services) -> list[Job]:
             Job("sync_subscriptions", 300, lambda: sync_subscriptions(svc, svc.now()), initial_delay=0,
                 alert_after=3),
             Job("poll_checkouts", 30, lambda: poll_checkouts(svc, svc.now()), initial_delay=5, alert_after=3),
-            Job("check_disputes", 86400, lambda: check_disputes(svc, svc.now()), initial_delay=120),
+            # Daily, but a failed check is retried after half an hour rather than a day later.
+            Job("check_disputes", 86400, lambda: check_disputes(svc, svc.now()), initial_delay=120,
+                alert_after=3, retry_interval=1800),
+            # Only does anything while the price couldn't be read (at startup, say):
+            # until then trial and subscribe checkouts are held back.
+            Job("refresh_price", 300, lambda: refresh_price(svc), initial_delay=60, alert_after=3),
         ]
     health = JobHealthStore(svc.db)
     jobs += [
@@ -215,23 +226,28 @@ class Scheduler:
         self._tasks: dict[str, asyncio.Task] = {}
 
     async def run_once(self, job: Job) -> bool:
-        """One guarded run. False if it failed or the previous run is still going."""
+        """One guarded run. False if it failed or the previous run is still going
+        (a run with nothing to do counts as not failed)."""
         lock = self.locks[job.name]
         if lock.locked():
             log.warning("Job %s is still running, skipping this tick", job.name)
             return False
         async with lock:
-            error = await self._attempt(job)
-            await self._track(job, error)
-        return error is None
+            outcome = await self._attempt(job)
+            if outcome is not SKIPPED:
+                await self._track(job, outcome)
+        return outcome is None or outcome is SKIPPED
 
-    async def _attempt(self, job: Job) -> str | None:
-        """Run the job. None if it worked, else a short description of what went wrong."""
+    async def _attempt(self, job: Job) -> str | Skipped | None:
+        """Run the job. None if it worked, SKIPPED if it had nothing to do, else a
+        short description of what went wrong."""
         try:
             result = await job.run()
         except Exception as exc:
             log.exception("Job %s failed", job.name)
             return short_error(exc)
+        if result is SKIPPED:
+            return SKIPPED
         if getattr(result, "ok", True) is False:
             # The job has logged the details itself.
             log.warning("Job %s finished with errors", job.name)
@@ -271,10 +287,10 @@ class Scheduler:
     async def _loop(self, job: Job) -> None:
         await self._sleep(job.initial_delay)
         while not self._stopping:
-            await self.run_once(job)
+            ok = await self.run_once(job)
             if self._stopping:
                 break
-            await self._sleep(job.interval)
+            await self._sleep(job.interval if ok or job.retry_interval is None else job.retry_interval)
 
     async def run(self) -> None:
         """Runs until stop() has finished, or until cancelled (which cancels every

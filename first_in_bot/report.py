@@ -19,7 +19,7 @@ from .admin import stats_text
 from .alerts import send_owner
 from .backup import BACKUP_DATE_KEY, BACKUP_FAILED_KEY
 from .billing import LAST_FULL_SYNC_KEY
-from .daily import daily_due, mark_done
+from .daily import SKIPPED, Skipped, daily_due, mark_done
 from .maintenance import describe_duration, paused_since
 from .services import Services
 from .sweep import CONFIRM_TTL, SYNC_MAX_AGE, _fit, pending_confirm
@@ -112,9 +112,16 @@ async def backup_line(svc: Services) -> str:
 
 def mode_lines(svc: Services) -> list[str]:
     """Also used by the startup alert."""
-    stripe = f"{svc.config.stripe_mode} mode" if svc.stripe is not None else "not configured (payments are off)"
-    removals = "on" if svc.config.removals_enabled else "dry run (nobody is removed)"
-    return [f"Stripe: {stripe}", f"Removals: {removals}"]
+    removals = f"Removals: {'on' if svc.config.removals_enabled else 'dry run (nobody is removed)'}"
+    if svc.stripe is None:
+        return ["Stripe: not configured (payments are off)", removals]
+    if svc.price_label is None:
+        # The price must come before any Stripe link, so no checkouts until it's read.
+        return [f"Stripe: {svc.config.stripe_mode} mode",
+                "⚠️ Couldn't read the price from Stripe. Until it can (it's retried every 5 minutes), "
+                "the trial and subscribe buttons ask people to try again in a few minutes.",
+                removals]
+    return [f"Stripe: {svc.config.stripe_mode} mode, {html.escape(svc.price_label)}", removals]
 
 
 async def report_text(svc: Services, now: datetime, health: Mapping[str, JobHealth]) -> str:
@@ -136,17 +143,21 @@ async def report_text(svc: Services, now: datetime, health: Mapping[str, JobHeal
     return "\n".join(lines)
 
 
-async def daily_report_job(svc: Services, now: datetime, health_source: HealthSource) -> bool:
+async def daily_report_job(svc: Services, now: datetime, health_source: HealthSource) -> bool | Skipped:
     """Scheduler job, every minute. Sends the report once a day, at REPORT_AT local
-    time or as soon after it as the bot is running. True when it went out."""
+    time or as soon after it as the bot is running. True when it went out.
+
+    SKIPPED when it isn't due, and when Telegram couldn't be reached (it's tried
+    again a minute later): neither says whether building the report works, so
+    neither may count as the job working again after a failure."""
     due, today = daily_due(now, svc.config.timezone, REPORT_AT, await svc.db.kv_get(REPORT_DATE_KEY))
     if not due:
-        return False
+        return SKIPPED
     health = await health_source.snapshot()
     result = await send_owner(svc, _fit(await report_text(svc, now, health)))
     if result is SendResult.FAILED:
         log.warning("Couldn't send the daily report; trying again in a minute")
-        return False
+        return SKIPPED
     await mark_done(svc.db, REPORT_DATE_KEY, today)
     if result is not SendResult.OK:
         # BLOCKED (the owner hasn't pressed /start) or REJECTED: retrying every minute won't help.
