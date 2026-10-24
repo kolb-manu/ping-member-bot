@@ -7,11 +7,13 @@ comes only from is_entitled, which treats sub_status trialing/active as entitled
 """
 from __future__ import annotations
 
+import html
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from . import texts
+from .alerts import alert_owner
 from .audit import audit, audit_if_changed
 from .db import Database, kv_set
 from .entitlement import DISPUTED_STATUS, ENTITLED_SUB_STATUSES
@@ -38,6 +40,7 @@ TERMINAL_STATUSES = frozenset({"canceled", "incomplete_expired"})
 MISSING_STATUS = "missing"
 # More than one checkout-poll pass, less than the 5-minute sync interval.
 SYNC_RACE_MARGIN = timedelta(seconds=120)
+ALERT_LIST_LIMIT = 20
 
 
 @dataclass(frozen=True)
@@ -423,6 +426,7 @@ async def sync_subscriptions(svc: Services, now: datetime) -> SyncResult:
     # (test-clock subscriptions aren't listed, a poll may have just stored a new
     # one), so ask Stripe for it. Only "no such subscription" marks it missing.
     listed = {s.id for s in subs}
+    missing: list[str] = []
     for row in await svc.db.fetchall(
         "SELECT telegram_id, stripe_sub_id FROM users WHERE stripe_sub_id IS NOT NULL AND sub_status IS NOT ?",
         (MISSING_STATUS,),
@@ -433,20 +437,22 @@ async def sync_subscriptions(svc: Services, now: datetime) -> SyncResult:
             sub = await svc.stripe.get_subscription(row["stripe_sub_id"])
         except SubscriptionMissing:
             if row["telegram_id"] not in groups:   # otherwise their listed subs replace it below
-                await _mark_sub_missing(svc.db, row["telegram_id"], row["stripe_sub_id"], now)
+                if await _mark_sub_missing(svc.db, row["telegram_id"], row["stripe_sub_id"], now):
+                    missing.append(f"user {row['telegram_id']}: {row['stripe_sub_id']}")
             continue
         except StripeGatewayError:
             result.ok = False
             continue
         groups.setdefault(row["telegram_id"], []).append(sub)
 
+    duplicates: list[str] = []
     for telegram_id, user_subs in groups.items():
         try:
             live = sorted(s.id for s in user_subs if s.status not in TERMINAL_STATUSES)
             if len(live) > 1:
-                # TODO(phase 4): also alert the owner (rate-limited owner alerts).
                 log.warning("User %s has %d live subscriptions: %s", telegram_id, len(live), ", ".join(live))
                 result.multiple.append(telegram_id)
+                duplicates.append(f"user {telegram_id}: {', '.join(live)}")
                 async with svc.db.tx() as conn:
                     await audit_if_changed(conn, now, telegram_id, "multiple_subs", " ".join(live))
             # `now` was taken before the listing, so it is when this snapshot started.
@@ -465,16 +471,42 @@ async def sync_subscriptions(svc: Services, now: datetime) -> SyncResult:
             await kv_set(conn, LAST_FULL_SYNC_KEY, to_iso(now))
     log.info("Stripe sync: %d subscriptions, %d users updated, %d left for next sync, %d unmatched, ok=%s",
              result.subscriptions, result.users_updated, result.skipped, result.unmatched, result.ok)
+    # One alert per kind for the whole sync, after it: alert_owner never raises, so a
+    # failed DM can't fail the sync. It's rate-limited, so duplicates nobody has sorted
+    # out yet are a reminder every 30 minutes, not every sync.
+    if duplicates:
+        await alert_owner(svc, "multiple_subs", "\n".join([
+            "⚠️ <b>More than one live subscription</b>",
+            _alert_list(duplicates),
+            "Access comes from the best one. Cancel the extra one in the Stripe dashboard so they "
+            "aren't charged twice. Until then this reminder comes every 30 minutes.",
+        ]), now)
+    if missing:
+        await alert_owner(svc, "sub_missing", "\n".join([
+            "⚠️ <b>Subscription no longer at Stripe</b>",
+            _alert_list(missing),
+            "It no longer gives access (status 'missing'). That's expected if you deleted test data; "
+            "otherwise look in the Stripe dashboard. Any more in the next 30 minutes are only logged "
+            "and audited (/user shows them).",
+        ]), now)
     return result
 
 
-async def _mark_sub_missing(db: Database, telegram_id: int, sub_id: str, now: datetime) -> None:
+def _alert_list(items: list[str]) -> str:
+    shown = "\n".join(html.escape(item) for item in items[:ALERT_LIST_LIMIT])
+    extra = len(items) - ALERT_LIST_LIMIT
+    return shown + (f"\n… and {extra} more" if extra > 0 else "")
+
+
+async def _mark_sub_missing(db: Database, telegram_id: int, sub_id: str, now: datetime) -> bool:
+    """True if this call marked it, so each one is alerted once."""
     async with db.tx() as conn:
         cur = await conn.execute(
             "UPDATE users SET sub_status=?, past_due_since=NULL WHERE telegram_id=? AND stripe_sub_id=?",
             (MISSING_STATUS, telegram_id, sub_id),
         )
-        if cur.rowcount == 1:
-            # TODO(phase 4): also alert the owner.
-            log.warning("Subscription %s of %s no longer exists at Stripe; marked missing", sub_id, telegram_id)
-            await audit(conn, now, telegram_id, "sub_missing", sub_id)
+        if cur.rowcount != 1:
+            return False
+        log.warning("Subscription %s of %s no longer exists at Stripe; marked missing", sub_id, telegram_id)
+        await audit(conn, now, telegram_id, "sub_missing", sub_id)
+    return True

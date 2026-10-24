@@ -1,9 +1,16 @@
 """Entry point: load config, open the DB, wire up gateways, handlers and the
-background jobs, then long-poll Telegram until stopped."""
+background jobs, then long-poll Telegram until stopped.
+
+Shutdown (SIGTERM from systemd, or Ctrl+C): aiogram's start_polling handles both
+signals by stopping polling and returning. Then, in this order, the scheduler
+lets a job that's mid-run finish (bounded, see scheduler.STOP_TIMEOUT), the bot
+session closes (only now, as that job may still be sending DMs), and the DB closes.
+"""
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
 import os
 import sys
@@ -13,10 +20,12 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 
+from .alerts import alert_owner
 from .config import ConfigError, Config, load_config
 from .db import Database
 from .handlers import admin, billing, channel, start
 from .handlers.middleware import UnblockMiddleware
+from .report import mode_lines
 from .scheduler import Scheduler, build_jobs
 from .services import Services
 from .stripe_gateway import StripeGateway
@@ -58,6 +67,16 @@ def build_dispatcher(svc: Services) -> Dispatcher:
     return dp
 
 
+def startup_text(svc: Services, rights_problems: list[str]) -> str:
+    lines = ["🟢 <b>First In member bot started</b>", *mode_lines(svc)]
+    if rights_problems:
+        lines.append("⚠️ Paid channel setup:")
+        lines += [f"• {html.escape(problem)}" for problem in rights_problems]
+    else:
+        lines.append("Paid channel rights: OK")
+    return "\n".join(lines)
+
+
 async def run(config: Config) -> None:
     db = await Database.open(config.db_path)
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -65,7 +84,7 @@ async def run(config: Config) -> None:
     stripe_gw, price_label = await build_stripe(config)
     svc = Services(db=db, config=config, tg=tg, stripe=stripe_gw, price_label=price_label)
     dp = build_dispatcher(svc)
-    scheduler = Scheduler(build_jobs(svc))
+    scheduler = Scheduler(build_jobs(svc), svc=svc)
     scheduler_task: asyncio.Task | None = None
     try:
         me = await bot.get_me()
@@ -73,19 +92,25 @@ async def run(config: Config) -> None:
             log.warning(
                 "BOT_USERNAME is '%s' but this token belongs to @%s", config.bot_username, me.username
             )
-        for problem in await tg.bot_rights_problems(me.id):
+        problems = await tg.bot_rights_problems(me.id)
+        for problem in problems:
             log.warning("Paid channel setup: %s", problem)
         log.info("Starting @%s | Stripe: %s | removals enabled: %s",
                  me.username, config.stripe_mode if stripe_gw else "off", config.removals_enabled)
+        # Rate-limited like every alert, so a restart loop doesn't flood the owner.
+        await alert_owner(svc, "startup", startup_text(svc, problems), svc.now())
         scheduler_task = asyncio.create_task(scheduler.run(), name="scheduler")
-        await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES)
+        # The session is closed below, after the scheduler, not by aiogram.
+        await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES, close_bot_session=False)
     finally:
-        if scheduler_task is not None:
-            scheduler_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await scheduler_task
-        await bot.session.close()
-        await db.close()
+        try:
+            if scheduler_task is not None:
+                await scheduler.stop()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await scheduler_task
+        finally:
+            await bot.session.close()
+            await db.close()
 
 
 def main() -> None:
