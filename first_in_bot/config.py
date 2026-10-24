@@ -38,6 +38,8 @@ class Config:
     timezone: ZoneInfo
     support_contact: str
     db_path: str
+    backup_dir: str
+    backup_keep: int
 
     @property
     def stripe_mode(self) -> str:
@@ -123,6 +125,8 @@ def load_config(env: Mapping[str, str]) -> Config:
     reminder_days = integer("TRIAL_REMINDER_DAYS_BEFORE", 3, 1)
     grace_hours = integer("PAST_DUE_GRACE_HOURS", 72, 0)
     max_removals = integer("MAX_REMOVALS_PER_SWEEP", 5, 1)
+    # At least one, so pruning can never delete the backup it has just made.
+    backup_keep = integer("BACKUP_KEEP", 14, 1)
 
     removals_raw = get("REMOVALS_ENABLED", "false").lower()
     if removals_raw in _TRUE:
@@ -176,4 +180,6 @@ def load_config(env: Mapping[str, str]) -> Config:
         timezone=tz,
         support_contact=get("SUPPORT_CONTACT"),
         db_path=get("DB_PATH", "data/first-in.db"),
+        backup_dir=get("BACKUP_DIR", "backups"),
+        backup_keep=backup_keep,
     )

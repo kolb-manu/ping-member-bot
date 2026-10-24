@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from first_in_bot.config import ConfigError, load_config
@@ -81,3 +83,25 @@ def test_trial_reminder_days_default_and_validation():
     for bad in ("0", "soon"):
         with pytest.raises(ConfigError):
             load_config({**GOOD, "TRIAL_REMINDER_DAYS_BEFORE": bad})
+
+
+def test_backup_settings_default_and_validation():
+    c = load_config(GOOD)
+    assert c.backup_dir == "backups"
+    assert c.backup_keep == 14
+    c = load_config({**GOOD, "BACKUP_DIR": " /srv/first-in/backups ", "BACKUP_KEEP": "1"})
+    assert c.backup_dir == "/srv/first-in/backups"
+    assert c.backup_keep == 1
+    # Blank means the default, like the other optional keys.
+    blank = load_config({**GOOD, "BACKUP_DIR": "", "BACKUP_KEEP": ""})
+    assert (blank.backup_dir, blank.backup_keep) == ("backups", 14)
+    for bad in ("0", "-3", "a fortnight"):
+        with pytest.raises(ConfigError) as e:
+            load_config({**GOOD, "BACKUP_KEEP": bad})
+        assert "BACKUP_KEEP" in str(e.value)
+
+
+def test_env_example_has_the_backup_keys():
+    text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
+    assert "\nBACKUP_DIR=backups\n" in text
+    assert "\nBACKUP_KEEP=14\n" in text
