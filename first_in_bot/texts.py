@@ -76,7 +76,7 @@ def how_it_works_trial(terms: str, reminder_days: int, days: int) -> str:
     return HOW_IT_WORKS_TRIAL_TEMPLATE.format(terms=terms, reminder_days=reminder_days, trial_label=trial_label(days))
 
 
-# The 14-day text, for callers that don't pass TRIAL_DAYS yet (use how_it_works_trial).
+# The standard 14-day wording (the code uses how_it_works_trial with TRIAL_DAYS).
 HOW_IT_WORKS_TRIAL = HOW_IT_WORKS_TRIAL_TEMPLATE.replace("{trial_label}", trial_label(14))
 
 # For people who've already had their free trial: they're charged straight away.
@@ -219,7 +219,7 @@ STATUS_INCOMPLETE ="Your checkout didn't finish. Tap /subscribe to try again."
 STATUS_GRANT = "🎟 Free access until <b>{end}</b>."
 STATUS_ENDED = "Your subscription has ended. Tap /subscribe to get instant alerts back."
 STATUS_NONE_TRIAL_TEMPLATE = "You haven't started your free trial yet. Tap /subscribe to start your free {trial_length}."
-# The 14-day text, for callers that don't pass TRIAL_DAYS yet (format the template with trial_length).
+# The standard 14-day wording (the code formats the template with TRIAL_DAYS).
 STATUS_NONE_TRIAL = STATUS_NONE_TRIAL_TEMPLATE.format(trial_length=trial_length(14))
 STATUS_NONE = "You don't have a subscription. Tap /subscribe to get instant alerts."
 

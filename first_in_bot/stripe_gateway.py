@@ -198,15 +198,20 @@ def _redact(text: str) -> str:
 
 # --- Gateway ----------------------------------------------------------------------
 
+def make_client(api_key: str) -> Any:
+    """The Stripe client the bot uses, also used by the preflight check."""
+    return stripe.StripeClient(
+        api_key,
+        stripe_version=STRIPE_API_VERSION,
+        max_network_retries=STRIPE_RETRIES,
+        http_client=stripe.RequestsClient(timeout=STRIPE_TIMEOUT),
+    )
+
+
 class StripeGateway:
     def __init__(self, api_key: str, *, client: Any | None = None):
         # client is for tests; normally we build the real one here.
-        self._client = client or stripe.StripeClient(
-            api_key,
-            stripe_version=STRIPE_API_VERSION,
-            max_network_retries=STRIPE_RETRIES,
-            http_client=stripe.RequestsClient(timeout=STRIPE_TIMEOUT),
-        )
+        self._client = client or make_client(api_key)
 
     async def _call(self, name: str, fn: Callable[[], T]) -> T:
         log.info("Stripe call: %s", name)

@@ -44,7 +44,7 @@ from dotenv import find_dotenv, load_dotenv
 from .config import Config, ConfigError, load_config
 from .db import MIGRATIONS
 from .lock import AlreadyRunning, acquire_instance_lock, lock_path_for
-from .stripe_gateway import STRIPE_API_VERSION, StripeGateway
+from .stripe_gateway import StripeGateway, make_client
 from .telegram_gateway import TelegramGateway
 
 # Bot tokens (also inside .../bot<token>/getMe URLs) and Stripe keys.
@@ -337,10 +337,8 @@ async def preflight(config: Config, *, session: BaseSession | None = None,
     tg = TelegramGateway(bot, config.paid_channel_id)
     stripe_gw = lister = None
     if config.stripe_api_key:
-        # One client for the price and the permission probes, made as StripeGateway makes its own.
-        client = stripe_client or stripe.StripeClient(
-            config.stripe_api_key, stripe_version=STRIPE_API_VERSION, max_network_retries=3
-        )
+        # One client for the price and the permission probes, the same as the bot's.
+        client = stripe_client or make_client(config.stripe_api_key)
         stripe_gw, lister = StripeGateway(config.stripe_api_key, client=client), ClientLister(client)
     backup_dir = config.backup_dir
     try:

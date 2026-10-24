@@ -52,6 +52,8 @@ STOP_TIMEOUT = 25.0
 FAILURE_NOTES = {
     "sync_subscriptions": "Removing anyone with Stripe data is on hold until a sync succeeds, "
                           "because the removal sweep skips them while the sync is stale.",
+    "sweep_removals": "Telegram refused to remove someone: check the bot still has the Ban users right "
+                      "in the paid channel. /dryrun shows who is waiting.",
 }
 
 

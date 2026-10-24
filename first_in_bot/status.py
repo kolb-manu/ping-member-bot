@@ -69,5 +69,6 @@ def status_text(user: User, now: datetime, config: Config, price_label: str | No
     if grant:
         lines.append(grant)
     if not detail and not grant:
-        lines.append(texts.STATUS_NONE_TRIAL if trial_eligible(user) else texts.STATUS_NONE)
+        lines.append(texts.STATUS_NONE_TRIAL_TEMPLATE.format(trial_length=texts.trial_length(config.trial_days))
+                     if trial_eligible(user) else texts.STATUS_NONE)
     return "\n".join(lines)

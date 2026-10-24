@@ -500,3 +500,19 @@ async def test_how_it_works_answers_even_from_an_old_or_deleted_message(svc, tg)
     await on_how(cb, svc)
     [text] = tg.sent_to(1)
     assert "14 days free" in text and "£2.99/month" in text and "A card is required" in text
+
+
+# --- trial length follows TRIAL_DAYS everywhere ------------------------------------------
+
+def test_trial_wording_follows_trial_days_on_every_screen():
+    short = load_config({**GOOD, "TRIAL_DAYS": "3"})
+    user = User(telegram_id=1)
+    [button] = welcome_keyboard(user, short).inline_keyboard[0]
+    assert button.text == "Start my free 3 days"
+    how = how_it_works_text(user, PRICE, short, NOW)
+    assert "Start my free 3 days" in how and "2 weeks" not in how
+    status = status_text(user, NOW, short, PRICE)
+    assert "start your free 3 days" in status and "2 weeks" not in status
+    # The owner's wording for the standard 14 days is unchanged.
+    [button] = welcome_keyboard(user, load_config(GOOD)).inline_keyboard[0]
+    assert button.text == "Start my free 2 weeks"

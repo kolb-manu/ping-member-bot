@@ -115,7 +115,7 @@ async def manage_reply(svc: Services, telegram_id: int, now: datetime) -> Reply:
         return early
     assert user is not None and svc.stripe is not None
     if not user.stripe_customer_id:
-        return Reply(texts.MANAGE_NO_CUSTOMER, subscribe_keyboard(user))
+        return Reply(texts.MANAGE_NO_CUSTOMER, subscribe_keyboard(user, svc.config.trial_days))
     try:
         url = await svc.stripe.portal_url(user.stripe_customer_id, svc.config.bot_link)
     except PortalNotConfigured:
@@ -126,7 +126,7 @@ async def manage_reply(svc: Services, telegram_id: int, now: datetime) -> Reply:
         # Forget it; their next checkout creates a new customer.
         await forget_missing_customer(svc.db, telegram_id, user.stripe_customer_id, now)
         user = await get_user(svc.db, telegram_id)
-        return Reply(texts.MANAGE_NO_CUSTOMER, subscribe_keyboard(user))
+        return Reply(texts.MANAGE_NO_CUSTOMER, subscribe_keyboard(user, svc.config.trial_days))
     except StripeGatewayError:
         return Reply(texts.STRIPE_ERROR)
     return Reply(texts.MANAGE_LINK, portal_keyboard(url))
@@ -139,7 +139,7 @@ async def status_reply(svc: Services, telegram_id: int, now: datetime) -> Reply:
     text = status_text(user, now, svc.config, svc.price_label)
     markup = None
     if not user.banned and not svc.entitled(user, now):
-        markup = subscribe_keyboard(user)
+        markup = subscribe_keyboard(user, svc.config.trial_days)
     return Reply(text, markup)
 
 

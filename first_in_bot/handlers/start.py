@@ -25,10 +25,11 @@ router.callback_query.filter(F.message.chat.type == "private")
 
 
 def welcome_keyboard(user: User, config: Config) -> InlineKeyboardMarkup:
-    # "Start my free 2 weeks" if they can still have the trial, otherwise "Subscribe".
+    # "Start my free 2 weeks" (or N days, per TRIAL_DAYS) if they can still have the
+    # trial, otherwise "Subscribe".
     # Both open a Stripe Checkout (handlers/billing.py).
     rows: list[list[InlineKeyboardButton]] = [
-        [checkout_button(user)],
+        [checkout_button(user, trial_days=config.trial_days)],
         [InlineKeyboardButton(text="Join the free channel", url=config.free_channel_link)],
         [InlineKeyboardButton(text="How it works", callback_data=CB_HOW)],
     ]
@@ -70,9 +71,10 @@ def how_it_works_text(user: User | None, price_label: str | None, config: Config
     if user is not None and not trial_eligible(user):
         return texts.HOW_IT_WORKS_SUBSCRIBE.format(price=texts.price_text(price_label))
     charge_date = format_local_date(now + timedelta(days=config.trial_days), config.timezone)
-    return texts.HOW_IT_WORKS_TRIAL.format(
-        terms=texts.trial_terms(price_label, config.trial_days, charge_date),
-        reminder_days=config.trial_reminder_days_before,
+    return texts.how_it_works_trial(
+        texts.trial_terms(price_label, config.trial_days, charge_date),
+        config.trial_reminder_days_before,
+        config.trial_days,
     )
 
 
