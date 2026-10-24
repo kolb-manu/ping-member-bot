@@ -1,5 +1,8 @@
 """Admin commands: /stats, /report, /user, /grant, /revoke, /ban, /unban, /dryrun, /confirmsweep,
-/pause and /resume. Only for ADMIN_IDS; anyone else gets no reply at all."""
+/pause and /resume. Only for ADMIN_IDS; anyone else gets no reply at all.
+
+A @username that several stored users share is refused with the list of them,
+so a command never lands on someone who merely used to have that name."""
 from __future__ import annotations
 
 import html
@@ -9,12 +12,13 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
 from .. import admin
+from ..models import User
 from ..report import report_text
 from ..scheduler import JobHealthStore
 from ..services import Services
-from ..sweep import _fit, confirm_sweep, format_report, offer_confirm, sweep_removals
+from ..sweep import _fit, confirm_sweep, format_report, offer_in_reply, sweep_removals
 from ..timeutil import format_local
-from ..users import find_user
+from ..users import find_users
 
 router = Router(name="admin")
 router.message.filter(F.chat.type == "private")
@@ -24,6 +28,19 @@ NO_SUCH_USER = "No user found for {ref}. They need to /start the bot first."
 
 def is_admin(message: Message, svc: Services) -> bool:
     return message.from_user is not None and message.from_user.id in svc.config.admin_ids
+
+
+async def _one_user(message: Message, svc: Services, ref: str) -> User | None:
+    """The one user ref names, or None once the admin has been told why not
+    (nobody has it, or several stored users share that @username)."""
+    users = await find_users(svc.db, ref)
+    if not users:
+        await message.answer(NO_SUCH_USER.format(ref=html.escape(ref)))
+        return None
+    if len(users) > 1:
+        await message.answer(admin.ambiguous_text(ref, users, svc.config.timezone))
+        return None
+    return users[0]
 
 
 @router.message(Command("stats"))
@@ -50,9 +67,8 @@ async def cmd_user(message: Message, command: CommandObject, svc: Services) -> N
     if not ref:
         await message.answer("Usage: /user &lt;telegram_id or @username&gt;")
         return
-    user = await find_user(svc.db, ref)
+    user = await _one_user(message, svc, ref)
     if user is None:
-        await message.answer(NO_SUCH_USER.format(ref=html.escape(ref)))
         return
     await message.answer(await admin.user_text(svc.db, user, svc.config.timezone))
 
@@ -66,20 +82,20 @@ async def cmd_grant(message: Message, command: CommandObject, svc: Services) -> 
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer(usage)
         return
-    user = await find_user(svc.db, parts[0])
+    user = await _one_user(message, svc, parts[0])
     if user is None:
-        await message.answer(NO_SUCH_USER.format(ref=html.escape(parts[0])))
         return
     try:
         user = await admin.grant(svc.db, user, int(parts[1]), svc.now(), by=message.from_user.id)
     except ValueError as exc:
         await message.answer(html.escape(str(exc)))
         return
+    name = html.escape(admin.who(user))
     if user.manual_grant_until is None:
-        await message.answer(f"Grant cleared for {user.telegram_id}.")
+        await message.answer(f"Grant cleared for {name}.")
     else:
         until = format_local(user.manual_grant_until, svc.config.timezone)
-        await message.answer(f"✅ {user.telegram_id} has free access until {until}.")
+        await message.answer(f"✅ {name} has free access until {until}.")
 
 
 async def _target_command(message: Message, command: CommandObject, svc: Services, name: str, action) -> None:
@@ -90,9 +106,8 @@ async def _target_command(message: Message, command: CommandObject, svc: Service
     if not ref or len(ref.split()) != 1:
         await message.answer(f"Usage: /{name} &lt;telegram_id or @username&gt;")
         return
-    user = await find_user(svc.db, ref)
+    user = await _one_user(message, svc, ref)
     if user is None:
-        await message.answer(NO_SUCH_USER.format(ref=html.escape(ref)))
         return
     try:
         text = await action(svc, user, svc.now(), message.from_user.id)
@@ -132,7 +147,7 @@ async def cmd_confirmsweep(message: Message, svc: Services) -> None:
     await message.answer(result.text)
     if result.offer is not None:
         # Only once the owner has the new report: an approval must match what they saw.
-        await offer_confirm(svc, result.offer, svc.now())
+        await offer_in_reply(svc, result.offer, svc.now())
 
 
 @router.message(Command("pause"))

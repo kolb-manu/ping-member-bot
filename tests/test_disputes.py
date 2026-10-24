@@ -194,3 +194,69 @@ async def test_write_subscription_clear_flag_is_the_only_way_out(svc):
     assert (await get_user(svc.db, 1)).sub_status == "disputed"
     await write_subscription(svc.db, 1, sub, NOW, clear_dispute=True)
     assert (await get_user(svc.db, 1)).sub_status == "active"
+
+
+# --- holds that never clear on their own ---------------------------------------------------------
+
+@pytest.mark.parametrize("status", ["warning_needs_response", "warning_under_review"])
+async def test_an_issuer_inquiry_holds_access_too(svc, stripe_fake, status):
+    # Spec 7.4 makes no exception for inquiries; whether it should is an owner question.
+    await add_user(svc.db, 1, **ACTIVE)
+    stripe_fake.disputes = [dispute(status=status)]
+    await check_disputes(svc, NOW)
+    assert (await get_user(svc.db, 1)).sub_status == "disputed"
+
+
+@pytest.mark.parametrize("status", ["lost", "prevented"])
+async def test_a_final_dispute_says_the_hold_wont_clear_and_how_to_let_them_in(svc, tg, stripe_fake, status):
+    await add_user(svc.db, 1, **ACTIVE)
+    stripe_fake.disputes = [dispute(status=status)]
+    for day in range(3):
+        await check_disputes(svc, NOW + day * D)
+    assert (await get_user(svc.db, 1)).sub_status == "disputed"      # what holds access is unchanged
+    [alert] = tg.sent_to(OWNER)
+    assert f"This dispute is closed ({status}), so the hold won't clear on its own" in alert
+    assert "use /grant 1 &lt;days&gt; to let them back in" in alert
+
+
+async def test_an_open_dispute_alert_doesnt_say_it_is_final(svc, tg, stripe_fake):
+    await add_user(svc.db, 1, **ACTIVE)
+    stripe_fake.disputes = [dispute(status="needs_response")]
+    await check_disputes(svc, NOW)
+    assert "won't clear" not in tg.sent_to(OWNER)[0]
+
+
+async def test_a_dispute_that_is_later_lost_is_alerted_again_once(svc, tg, stripe_fake):
+    await add_user(svc.db, 1, **ACTIVE)
+    stripe_fake.disputes = [dispute(status="needs_response")]
+    await check_disputes(svc, NOW)
+    stripe_fake.disputes = [dispute(status="under_review")]
+    await check_disputes(svc, NOW + D)
+    assert len(tg.sent_to(OWNER)) == 1                                # an ordinary status change: quiet
+    stripe_fake.disputes = [dispute(status="lost")]
+    await check_disputes(svc, NOW + 2 * D)
+    await check_disputes(svc, NOW + 3 * D)
+    assert len(tg.sent_to(OWNER)) == 2 and "won't clear on its own" in tg.sent_to(OWNER)[1]
+
+
+async def test_a_grant_lets_a_held_user_back_in(svc, stripe_fake):
+    from first_in_bot.admin import grant
+
+    await add_user(svc.db, 1, **ACTIVE)
+    stripe_fake.disputes = [dispute(status="prevented")]
+    await check_disputes(svc, NOW)
+    user = await grant(svc.db, await get_user(svc.db, 1), 30, NOW, by=OWNER)
+    assert user.sub_status == "disputed" and svc.entitled(user, NOW + 29 * D)
+
+
+async def test_clearing_follows_resolved_for_us(svc, stripe_fake, monkeypatch):
+    """The SQL that finds users to restore is built from RESOLVED_FOR_US, so the two can't drift."""
+    from first_in_bot import disputes
+
+    await add_user(svc.db, 1, **ACTIVE)
+    stripe_fake.disputes = [dispute(status="prevented")]
+    await check_disputes(svc, NOW)
+    stripe_fake.retrievable["sub_1"] = sub_info(id="sub_1", status="active", customer="cus_1", telegram_id=1)
+    monkeypatch.setattr(disputes, "RESOLVED_FOR_US", frozenset({"won", "warning_closed", "prevented"}))
+    assert (await check_disputes(svc, NOW + D)).cleared == 1
+    assert (await get_user(svc.db, 1)).sub_status == "active"

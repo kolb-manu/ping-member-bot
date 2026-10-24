@@ -1,7 +1,12 @@
 """Daily disputes check (spec 7.4). A new dispute on a user's charge sets their
 sub_status to the local "disputed" (not entitled) and alerts the owner. It never
-bans anyone. When every dispute of a disputed user has been won, the status is
-restored from Stripe.
+bans anyone. Every status that isn't resolved in our favour holds access,
+issuer inquiries (warning_*) included, as spec 7.4 says. When every dispute of a
+disputed user has been won, the status is restored from Stripe.
+
+A lost or prevented dispute is final, so that hold never clears on its own. The
+owner is told so, then and when a dispute moves to one of those statuses, with
+the way out: /grant overrides the hold (is_entitled checks grants first).
 
 write_subscription keeps a "disputed" status through the 5-minute sync, so the
 flag only ever changes here.
@@ -26,6 +31,9 @@ log = logging.getLogger(__name__)
 
 # Dispute statuses that end in the business's favour. A "lost" one stays disputed.
 RESOLVED_FOR_US = frozenset({"won", "warning_closed"})
+# Final, and not in our favour: the hold stays until the owner steps in. "prevented"
+# is Stripe's dispute prevention settling or blocking the case before a chargeback.
+NEVER_CLEARS = frozenset({"lost", "prevented"})
 
 
 @dataclass
@@ -55,9 +63,12 @@ async def _record(svc: Services, d: DisputeInfo, telegram_id: int | None, now: d
         old = await cur.fetchone()
         if old is not None:
             if old["status"] != d.status or (old["telegram_id"] is None and telegram_id is not None):
+                # Moving to a final status means the hold is now for good: alert again.
+                realert = old["status"] != d.status and d.status in NEVER_CLEARS
                 await conn.execute(
-                    "UPDATE disputes SET status=?, telegram_id=COALESCE(telegram_id, ?) WHERE id=?",
-                    (d.status, telegram_id, d.id),
+                    "UPDATE disputes SET status=?, telegram_id=COALESCE(telegram_id, ?), "
+                    "alerted=CASE WHEN ? THEN 0 ELSE alerted END WHERE id=?",
+                    (d.status, telegram_id, int(realert), d.id),
                 )
             return False
         resolved = d.status in RESOLVED_FOR_US
@@ -91,11 +102,17 @@ async def _alert_owner(svc: Services, d: DisputeInfo, telegram_id: int | None) -
     else:
         name = f" @{user.username}" if user.username else ""
         who = html.escape(f"{user.telegram_id}{name}")
+    held = ""
+    if user is not None:
+        held = "Their access is on hold (status 'disputed'). I have not banned them.\n"
+        if d.status in NEVER_CLEARS:
+            held += (f"This dispute is closed ({html.escape(d.status)}), so the hold won't clear on its own: "
+                     f"use /grant {user.telegram_id} &lt;days&gt; to let them back in.\n")
     text = (
         "⚠️ <b>Payment dispute</b>\n"
         f"Who: {who}\n"
         f"Dispute: {html.escape(d.id)} ({html.escape(d.status)})\n"
-        + ("Their access is on hold (status 'disputed'). I have not banned them.\n" if user else "")
+        + held
         + "Look at it in the Stripe dashboard."
     )
     if svc.owner_id is None:
@@ -119,12 +136,13 @@ async def _forget_status(svc: Services, telegram_id: int) -> None:
 async def _clear_resolved(svc: Services, now: datetime, result: DisputeResult) -> None:
     """Restore users whose disputes have all been won, from Stripe's own copy."""
     assert svc.stripe is not None
+    resolved = sorted(RESOLVED_FOR_US)   # built from the constant so the two can't drift apart
     rows = await svc.db.fetchall(
         "SELECT telegram_id, stripe_sub_id FROM users WHERE sub_status=? AND NOT EXISTS ("
         " SELECT 1 FROM disputes d WHERE d.telegram_id=users.telegram_id"
-        " AND d.status NOT IN ('won','warning_closed'))"
+        f" AND d.status NOT IN ({','.join('?' * len(resolved))}))"
         " AND EXISTS (SELECT 1 FROM disputes d WHERE d.telegram_id=users.telegram_id)",
-        (DISPUTED_STATUS,),
+        (DISPUTED_STATUS, *resolved),
     )
     for row in rows:
         telegram_id = row["telegram_id"]

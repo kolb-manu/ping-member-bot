@@ -196,8 +196,9 @@ async def test_revoke_and_ban_set_flags_but_dont_kick_while_paused(real_svc, tg)
     await add_user(real_svc.db, 6, in_paid_channel=True, manual_grant_until=NOW + 5 * D)
     await set_paused(real_svc.db, NOW, by=OWNER)
     paused_note = "Paused, so I didn't remove them; the sweep will once you /resume."
-    assert await admin.revoke(real_svc, await get_user(real_svc.db, 5), NOW, OWNER) == f"Grant cleared. {paused_note}"
-    assert await admin.ban(real_svc, await get_user(real_svc.db, 6), NOW, OWNER) == f"Banned 6. {paused_note}"
+    assert (await admin.revoke(real_svc, await get_user(real_svc.db, 5), NOW, OWNER)
+            == f"Grant cleared for 5 (@user5, Name). {paused_note}")
+    assert await admin.ban(real_svc, await get_user(real_svc.db, 6), NOW, OWNER) == f"Banned 6 (@user6, Name). {paused_note}"
     assert (await get_user(real_svc.db, 5)).manual_grant_until is None
     assert (await get_user(real_svc.db, 6)).banned
     assert tg.events == []                                     # not even a membership lookup

@@ -1,8 +1,18 @@
-"""User table access."""
+"""User table access.
+
+Admins name people by numeric ID or @username, so stored usernames are kept
+current: /start and every paid-channel member update refresh them, and whoever
+claims a username takes it off any other row (Telegram usernames are unique at
+any one time, so the other row is out of date). A lookup that still matches
+several rows returns them all and the caller asks for the numeric ID; it never
+guesses.
+"""
 from __future__ import annotations
 
 import re
 from datetime import datetime
+
+import aiosqlite
 
 from .audit import audit
 from .db import Database
@@ -28,18 +38,30 @@ async def get_user(db: Database, telegram_id: int) -> User | None:
     return User.from_row(row) if row else None
 
 
-async def find_user(db: Database, ref: str) -> User | None:
-    """Admin lookup by numeric Telegram ID or @username."""
+async def find_users(db: Database, ref: str) -> list[User]:
+    """Admin lookup by numeric Telegram ID or @username: everyone it matches, which
+    for a username can be more than one row (someone renamed and we haven't seen it)."""
     ref = ref.strip()
     if ref.lstrip("-").isdigit():
-        return await get_user(db, int(ref))
+        user = await get_user(db, int(ref))
+        return [user] if user else []
     name = ref.lstrip("@")
     if not name:
-        return None
-    row = await db.fetchone(
-        "SELECT * FROM users WHERE lower(username)=lower(?) ORDER BY created_at DESC LIMIT 1", (name,)
+        return []
+    rows = await db.fetchall("SELECT * FROM users WHERE lower(username)=lower(?) ORDER BY telegram_id", (name,))
+    return [User.from_row(row) for row in rows]
+
+
+async def _claim_username(conn: aiosqlite.Connection, telegram_id: int, username: str | None, now: datetime) -> None:
+    """telegram_id holds this username now, so any other row that has it is out of date."""
+    if not username:
+        return
+    cur = await conn.execute(
+        "SELECT telegram_id FROM users WHERE lower(username)=lower(?) AND telegram_id<>?", (username, telegram_id)
     )
-    return User.from_row(row) if row else None
+    for row in await cur.fetchall():
+        await conn.execute("UPDATE users SET username=NULL WHERE telegram_id=?", (row["telegram_id"],))
+        await audit(conn, now, row["telegram_id"], "username_cleared", f"@{username} now belongs to {telegram_id}")
 
 
 async def clear_blocked_bot(db: Database, telegram_id: int, now: datetime) -> bool:
@@ -61,8 +83,9 @@ async def clear_blocked_bot(db: Database, telegram_id: int, now: datetime) -> bo
 async def ensure_user(
     db: Database, telegram_id: int, username: str | None, first_name: str | None, now: datetime
 ) -> bool:
-    """Minimal row for someone we only know from the channel (never pressed /start).
-    Returns True if the row was created."""
+    """Minimal row for someone we only know from the channel (never pressed /start),
+    or, if we know them, their current names from Telegram. Returns True if the row
+    was created."""
     async with db.tx() as conn:
         cur = await conn.execute(
             "INSERT OR IGNORE INTO users(telegram_id, username, first_name, source, created_at) "
@@ -72,6 +95,13 @@ async def ensure_user(
         created = cur.rowcount == 1
         if created:
             await audit(conn, now, telegram_id, "user_created", "source=unknown via=channel")
+        else:
+            await conn.execute(
+                "UPDATE users SET username=?, first_name=? WHERE telegram_id=? "
+                "AND (username IS NOT ? OR first_name IS NOT ?)",
+                (username, first_name, telegram_id, username, first_name),
+            )
+        await _claim_username(conn, telegram_id, username, now)
     return created
 
 
@@ -115,6 +145,7 @@ async def register_user(
                         "INSERT INTO audit_log(ts, telegram_id, action, detail) VALUES(?,?,?,?)",
                         (to_iso(now), telegram_id, "source_set", f"source={source}"),
                     )
+        await _claim_username(conn, telegram_id, username, now)
     user = await get_user(db, telegram_id)
     assert user is not None
     return user, created

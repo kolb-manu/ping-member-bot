@@ -23,9 +23,11 @@ LIVE = ("trialing", "active", "past_due")
 
 class FakeClockDriver:
     """Minimal model of a Stripe subscription over time. Each period end opens the
-    next period and charges the current card an hour later; a cancellation at
-    period end takes effect at the period end; once the retries run out a past_due
-    subscription ends up as after_retries (the dashboard's "Manage failed payments")."""
+    next period and charges the current card an hour later; in that hour after the
+    trial a trialing subscription already says "active" and reports the new period
+    (the first invoice is still a draft); a cancellation at period end takes effect
+    at the period end; once the retries run out a past_due subscription ends up as
+    after_retries (the dashboard's "Manage failed payments")."""
 
     def __init__(self):
         self.t0 = T0
@@ -38,6 +40,7 @@ class FakeClockDriver:
         self.invoices: list[list] = []            # [status, amount]
         self.past_due_at: datetime | None = None
         self.after_retries = "past_due"
+        self.draft = False                        # in the hour between the trial end and the first charge
         self.closed = None
 
     async def start(self, card, settings):
@@ -58,6 +61,9 @@ class FakeClockDriver:
             elif when >= end + H:
                 self._renew(end)
                 assert self.period[1] > end, "a renewal must move the period on"
+            elif when >= end and self.status == "trialing":
+                self.status, self.draft = "active", True
+                break
             else:
                 break
         if self.status == "past_due" and when >= self.past_due_at + RETRIES_FOR:
@@ -66,6 +72,7 @@ class FakeClockDriver:
 
     def _renew(self, at):
         self.period = (at, at + MONTH)
+        self.draft = False
         if self.card == GOOD_CARD:
             self.invoices.append(["paid", PRICE])
             self.status = "active"
@@ -75,7 +82,7 @@ class FakeClockDriver:
                 self.status, self.past_due_at = "past_due", at
 
     async def subscription(self):
-        start, end = self.period
+        start, end = (self.period[1], self.period[1] + MONTH) if self.draft else self.period
         return sub_info(id="sub_tc", customer="cus_tc", telegram_id=script.TELEGRAM_ID, created=self.t0,
                         status=self.status, period_start=start, period_end=end,
                         trial_start=self.t0, trial_end=self.trial_end, cancel=self.cancel_at_end)
@@ -413,3 +420,27 @@ async def test_real_driver_pays_open_invoices_with_the_current_card_and_counts_r
     assert await driver.paid_invoice_count() == 1          # the £0 trial invoice doesn't count
     assert await driver.amount_paid() == PRICE
     assert all(p[0]["customer"] == "cus_1" for p in client.named("invoices.list"))
+
+
+async def test_failed_conversion_is_looked_at_in_the_draft_hour():
+    """Stripe says "active" for about an hour after the trial ends, before it tries the
+    card. The failed-conversion scenarios look then, as the bot's 5-minute sync does."""
+    for name in ("trial_failed", "payment_recovered"):
+        checks = await run_scenario(name, FakeClockDriver(), Settings())
+        draft = [c for c in checks if c.step == "trial just ended, card not charged yet"]
+        assert draft and all(c.ok for c in draft), draft
+        assert failures(checks) == [], failures(checks)
+
+
+async def test_script_catches_a_draft_hour_active_counted_as_paid(monkeypatch):
+    """The old rule (any "-> active" in the audit log means paid) gives a never-paid
+    trial the subscription goodbye; the draft-hour look must make the script fail it."""
+    async def any_active(svc, user):
+        row = await svc.db.fetchone(
+            "SELECT 1 FROM audit_log WHERE telegram_id=? AND action='sub_status' AND detail LIKE ?",
+            (user.telegram_id, f"{user.stripe_sub_id}: % -> active"))
+        return row is not None
+
+    monkeypatch.setattr(script, "_was_active", any_active)
+    checks = await run_scenario("trial_failed", FakeClockDriver(), Settings())
+    assert [c.detail for c in failures(checks)] == ["goodbye message would be 'sub_ended', want 'trial_ended'"]

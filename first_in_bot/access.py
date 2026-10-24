@@ -1,5 +1,5 @@
 """Paid-channel access: join requests (approve or decline via is_entitled) and
-chat_member updates (keeping users.in_paid_channel in step).
+chat_member updates (keeping users.in_paid_channel and the stored names in step).
 
 Everyone gets the same join-request link, so sharing it is harmless: the bot
 decides each request. Only the configured paid channel is handled.
@@ -106,7 +106,8 @@ async def handle_join_request(svc: Services, user_id: int, user_chat_id: int, no
         return JoinOutcome.APPROVED
 
     try:
-        await svc.tg.send(user_chat_id, texts.JOIN_DECLINED, subscribe_keyboard(user))  # failures ignored
+        await svc.tg.send(user_chat_id, texts.JOIN_DECLINED,
+                          subscribe_keyboard(user, svc.config.trial_days))  # failures ignored
     finally:
         await _decline(svc, user_id, now, "not entitled")
     return JoinOutcome.DECLINED_NOT_ENTITLED
@@ -121,7 +122,8 @@ async def handle_member_update(
     is_member: bool | None,
     now: datetime,
 ) -> bool:
-    """A chat_member update for the paid channel. Returns the new in-channel flag."""
+    """A chat_member update for the paid channel. Returns the new in-channel flag.
+    It carries their current username, so admin lookups by @username stay right."""
     await ensure_user(svc.db, user_id, username, first_name, now)
     value = in_channel(status, is_member)
     await set_in_channel(svc, user_id, value, now, f"status={status}")

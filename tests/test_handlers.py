@@ -79,6 +79,26 @@ def test_welcome_keyboard_trial_button_is_checkout():
     assert first.text == "Start my free 2 weeks" and first.callback_data == "trial:start"
 
 
+@pytest.mark.parametrize("days,label", [(14, "Start my free 2 weeks"), (3, "Start my free 3 days"),
+                                        (21, "Start my free 21 days")])
+def test_trial_button_and_how_it_works_follow_trial_days(days, label):
+    from first_in_bot.keyboards import checkout_button, subscribe_keyboard
+
+    assert checkout_button(User(telegram_id=1), trial_days=days).text == label
+    assert buttons(subscribe_keyboard(User(telegram_id=1), days))[0].text == label
+    assert f"1. Tap <b>{label}</b> and add your card" in texts.how_it_works_trial("terms", 3, days)
+    status = texts.STATUS_NONE_TRIAL_TEMPLATE.format(trial_length=texts.trial_length(days))
+    assert status.endswith(f"to start your free {label.removeprefix('Start my free ')}.")
+
+
+def test_the_owners_14_day_wording_is_unchanged():
+    assert texts.trial_label(14) == "Start my free 2 weeks"
+    assert texts.HOW_IT_WORKS_TRIAL.format(terms="T", reminder_days=3) == texts.how_it_works_trial("T", 3, 14)
+    assert "1. Tap <b>Start my free 2 weeks</b> and add your card" in texts.HOW_IT_WORKS_TRIAL
+    assert texts.STATUS_NONE_TRIAL == ("You haven't started your free trial yet. "
+                                       "Tap /subscribe to start your free 2 weeks.")
+
+
 @pytest.mark.parametrize("user,trial", [
     (None, True),
     (User(telegram_id=1), True),

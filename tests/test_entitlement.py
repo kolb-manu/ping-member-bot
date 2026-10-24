@@ -144,3 +144,11 @@ def test_cancelled_trial_with_cancel_at_period_end_stays_trialing_and_entitled()
 
 def test_banned_cancelled_trial_not_entitled():
     assert not is_entitled(user(sub_status="canceled", sub_trial_end=NOW + H, banned=True), NOW, GRACE)
+
+
+def test_a_grant_overrides_a_dispute_hold():
+    # The owner's way back in for a lost or prevented dispute, which never clears on its own.
+    assert not is_entitled(user(sub_status="disputed"), NOW, GRACE)
+    assert is_entitled(user(sub_status="disputed", manual_grant_until=NOW + H), NOW, GRACE)
+    assert not is_entitled(user(sub_status="disputed", manual_grant_until=NOW - H), NOW, GRACE)
+    assert not is_entitled(user(sub_status="disputed", manual_grant_until=NOW + H, banned=True), NOW, GRACE)

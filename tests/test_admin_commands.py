@@ -1,5 +1,5 @@
 """/revoke, /ban, /unban, /pause, /resume and /confirmsweep (spec section 10)."""
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from aiogram.filters import CommandObject
@@ -9,9 +9,11 @@ from first_in_bot.billing import LAST_FULL_SYNC_KEY
 from first_in_bot.db import kv_set
 from first_in_bot.handlers import admin as admin_handlers
 from first_in_bot.maintenance import paused_since, set_paused
+from first_in_bot.models import User
 from first_in_bot.sweep import CONFIRM_PROMPT, pending_confirm, sweep_removals
+from first_in_bot.telegram_gateway import SendResult
 from first_in_bot.timeutil import to_iso
-from first_in_bot.users import get_user
+from first_in_bot.users import get_user, register_user
 from tests.fakes import NOW, OWNER, add_user, audit_actions, make_svc
 from tests.test_handlers import FakeMessage, cmd
 
@@ -224,7 +226,7 @@ async def test_ban_while_paused_through_the_handler(real_svc, tg):
     await add_user(real_svc.db, 5, in_paid_channel=True)
     await say(admin_handlers.cmd_pause, real_svc)
     [reply] = await run(admin_handlers.cmd_ban, real_svc, "ban", "5")
-    assert reply == "Banned 5. Paused, so I didn't remove them; the sweep will once you /resume."
+    assert reply == "Banned 5 (@user5, Name). Paused, so I didn't remove them; the sweep will once you /resume."
     assert (await get_user(real_svc.db, 5)).banned and tg.calls("kick") == []
 
 
@@ -274,3 +276,109 @@ async def test_confirmsweep_command_while_paused(db, tg, stripe_fake):
     await say(admin_handlers.cmd_pause, svc)
     assert (await say(admin_handlers.cmd_confirmsweep, svc))[0].startswith("Paused: /resume first")
     assert tg.calls("kick") == []
+
+
+async def test_confirmsweep_refusal_counts_as_the_report_so_the_next_sweep_stays_quiet(db, tg, stripe_fake):
+    svc = await blocked(db, tg, stripe_fake)
+    await add_user(db, 13, in_paid_channel=True, manual_grant_until=NOW - D)
+    [reply] = await say(admin_handlers.cmd_confirmsweep, svc)
+    assert reply.startswith("Not going ahead")
+    owner_dms = len(tg.sent_to(OWNER))
+    async with db.tx() as conn:
+        await kv_set(conn, LAST_FULL_SYNC_KEY, to_iso(NOW + timedelta(minutes=5)))
+    await sweep_removals(svc, NOW + timedelta(minutes=10))
+    assert len(tg.sent_to(OWNER)) == owner_dms                  # the same report isn't DMed again
+    pending = await pending_confirm(db)
+    assert pending.ids == {10, 11, 12, 13} and pending.at == NOW  # and its hour didn't restart
+    rows = await db.fetchall("SELECT detail FROM audit_log WHERE action='sweep_blocked'")
+    assert len(rows) == 2                                       # the new set audited once, by the reply
+
+
+async def test_confirmsweep_with_nothing_pending_offers_a_blocked_sweep(db, tg, stripe_fake):
+    tg.send_results[OWNER] = SendResult.BLOCKED     # the owner never got the scheduled report
+    svc = await blocked(db, tg, stripe_fake)
+    assert await pending_confirm(db) is None
+    [reply] = await say(admin_handlers.cmd_confirmsweep, svc)
+    assert reply.startswith("Nothing is waiting for /confirmsweep, so nobody was removed.")
+    assert "Would remove (3)" in reply and reply.endswith(CONFIRM_PROMPT)
+    assert (await pending_confirm(db)).ids == {10, 11, 12} and tg.calls("kick") == []
+    await say(admin_handlers.cmd_confirmsweep, svc)
+    assert sorted(tg.calls("kick")) == [10, 11, 12]
+
+
+# --- who a command lands on --------------------------------------------------------------
+
+async def share_username(db, *ids, name="sam"):
+    """Rows from before usernames were claimed can still share one."""
+    for i in ids:
+        await add_user(db, i)
+    marks = ",".join("?" * len(ids))
+    async with db.tx() as conn:
+        await conn.execute(f"UPDATE users SET username=? WHERE telegram_id IN ({marks})", (name, *ids))
+
+
+@pytest.mark.parametrize("handler,name,args", [
+    (admin_handlers.cmd_ban, "ban", "@sam"),
+    (admin_handlers.cmd_revoke, "revoke", "@sam"),
+    (admin_handlers.cmd_unban, "unban", "@Sam"),
+    (admin_handlers.cmd_grant, "grant", "@sam 30"),
+    (admin_handlers.cmd_user, "user", "@sam"),
+])
+async def test_a_shared_username_is_refused_with_the_list(real_svc, tg, handler, name, args):
+    await share_username(real_svc.db, 1, 2)
+    async with real_svc.db.tx() as conn:
+        await conn.execute("UPDATE users SET banned=1, in_paid_channel=1, manual_grant_until=? "
+                           "WHERE telegram_id IN (1, 2)", (to_iso(NOW + 5 * D),))
+    before = [tuple(r) for r in await real_svc.db.fetchall("SELECT * FROM users ORDER BY telegram_id")]
+    [reply] = await run(handler, real_svc, name, args)
+    assert reply.startswith("Several users have @") and "use the numeric ID" in reply
+    assert "• 1 (@sam, Name), joined 1 Nov 2026" in reply and "• 2 (@sam, Name)" in reply
+    assert [tuple(r) for r in await real_svc.db.fetchall("SELECT * FROM users ORDER BY telegram_id")] == before
+    assert tg.events == []
+
+
+async def test_ban_by_username_after_a_rename_hits_whoever_has_it_now(real_svc, tg):
+    # Paying A joined in October as @sam and renamed; B (September) took @sam and pressed /start.
+    await add_user(real_svc.db, 2, username="bob", created_at=datetime(2026, 9, 1, tzinfo=timezone.utc))
+    await add_user(real_svc.db, 1, username="sam", created_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+                   in_paid_channel=True, stripe_sub_id="sub_1", sub_status="active", sub_period_end=NOW + 20 * D)
+    await register_user(real_svc.db, 2, "sam", "B", None, NOW)
+    [reply] = await run(admin_handlers.cmd_ban, real_svc, "ban", "@sam")
+    assert reply.startswith("Banned 2 (@sam, B).")
+    assert not (await get_user(real_svc.db, 1)).banned and (await get_user(real_svc.db, 2)).banned
+    assert 1 not in tg.calls("kick") and 1 not in tg.calls("status")
+
+
+async def test_replies_name_the_person_escaped(real_svc):
+    await add_user(real_svc.db, 5, username="<sam>", manual_grant_until=NOW + 5 * D)
+    async with real_svc.db.tx() as conn:
+        await conn.execute("UPDATE users SET first_name='Sam & co' WHERE telegram_id=5")
+    msg = FakeMessage(OWNER)
+    await admin_handlers.cmd_grant(msg, cmd("grant", "5 7"), real_svc)
+    assert msg.answers[0][0].startswith("✅ 5 (@&lt;sam&gt;, Sam &amp; co) has free access until")
+    [reply] = await run(admin_handlers.cmd_revoke, real_svc, "revoke", "5")
+    assert reply.startswith("Grant cleared for 5 (@&lt;sam&gt;, Sam &amp; co).")
+    assert admin.who(User(telegram_id=7)) == "7" and admin.who(User(telegram_id=7, first_name="Al")) == "7 (Al)"
+
+
+@pytest.mark.parametrize("fields,warned", [
+    ({"sub_status": "active"}, True),
+    ({"sub_status": "trialing"}, True),
+    ({"sub_status": "past_due"}, True),
+    ({"sub_status": "disputed"}, True),                                   # hides Stripe's own, usually active
+    ({"sub_status": "past_due", "cancel_at_period_end": True}, True),    # still retrying the open invoice
+    ({"sub_status": "active", "cancel_at_period_end": True}, False),     # ends without another charge
+    ({"sub_status": "canceled"}, False),
+])
+async def test_ban_warns_when_stripe_will_keep_charging(svc, fields, warned):
+    await add_user(svc.db, 5, in_paid_channel=True, stripe_customer_id="cus_5", stripe_sub_id="sub_5",
+                   sub_period_end=NOW + 20 * D, **fields)
+    [reply] = await run(admin_handlers.cmd_ban, svc, "ban", "5")
+    assert reply.startswith("Banned 5 (@user5, Name).")
+    assert ("cancel sub_5 in the Stripe dashboard so they aren't charged" in reply) is warned
+
+
+async def test_ban_without_a_subscription_has_no_stripe_warning(svc):
+    await add_user(svc.db, 5, manual_grant_until=NOW + 5 * D)
+    [reply] = await run(admin_handlers.cmd_ban, svc, "ban", "5")
+    assert "Stripe" not in reply

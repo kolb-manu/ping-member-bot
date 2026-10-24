@@ -38,6 +38,16 @@ def trial_terms(price_label: str | None, days: int, charge_date: str, fixed: boo
     return template.format(price=price_text(price_label), days=days, charge_date=charge_date)
 
 
+def trial_length(days: int) -> str:
+    """The owner's wording is "2 weeks" for the standard 14 days. Any other TRIAL_DAYS
+    (e.g. 3 for testing) says the real length, so the button never contradicts the terms."""
+    return "2 weeks" if days == 14 else f"{days} days"
+
+
+def trial_label(days: int) -> str:
+    return f"Start my free {trial_length(days)}"
+
+
 # --- Welcome ---------------------------------------------------------------
 
 WELCOME = (
@@ -52,14 +62,23 @@ OFFER_TRIAL = (
 )
 OFFER_SUBSCRIBE = "Instant alerts are {price}. Cancel anytime."
 
-HOW_IT_WORKS_TRIAL = (
+HOW_IT_WORKS_TRIAL_TEMPLATE = (
     "<b>How it works</b>\n"
     "{terms}\n\n"
-    "1. Tap <b>Start my free 2 weeks</b> and add your card on Stripe's secure page.\n"
+    "1. Tap <b>{trial_label}</b> and add your card on Stripe's secure page.\n"
     "2. Join the alerts channel and turn notifications on. Alerts arrive the second tickets drop.\n"
     "3. We message you {reminder_days} days before your first payment, and again a few hours before.\n"
     "Prefer not to pay? Follow the free channel (alerts arrive about 10 minutes later)."
 )
+
+
+def how_it_works_trial(terms: str, reminder_days: int, days: int) -> str:
+    return HOW_IT_WORKS_TRIAL_TEMPLATE.format(terms=terms, reminder_days=reminder_days, trial_label=trial_label(days))
+
+
+# The 14-day text, for callers that don't pass TRIAL_DAYS yet (use how_it_works_trial).
+HOW_IT_WORKS_TRIAL = HOW_IT_WORKS_TRIAL_TEMPLATE.replace("{trial_label}", trial_label(14))
+
 # For people who've already had their free trial: they're charged straight away.
 HOW_IT_WORKS_SUBSCRIBE = (
     "<b>How it works</b>\n"
@@ -136,6 +155,22 @@ ACCESS_ENDED = (
     "Your free access has ended, so you've been removed from instant alerts. "
     "Subscribe anytime to get them back."
 )
+# Nothing has ended here: a payment dispute put access on hold (disputes.py), the
+# subscription may still be running, and a new checkout is refused. So no Resubscribe.
+DISPUTED_HOLD = (
+    "⚠️ A payment on your account has been disputed, so your access to the instant alerts is on hold "
+    "and you've been removed from the channel for now."
+)
+DISPUTED_MISTAKE = "If that's a mistake, please message {support} and we'll sort it."
+FREE_CHANNEL_MEANWHILE = "You can still follow the free channel (alerts arrive about 10 minutes later)."
+
+
+def disputed_hold(support: str | None) -> str:
+    """The goodbye for someone held because of a dispute. support is already HTML-escaped."""
+    lines = [DISPUTED_HOLD + (" " + DISPUTED_MISTAKE.format(support=support) if support else ""),
+             FREE_CHANNEL_MEANWHILE]
+    return "\n".join(lines)
+
 
 # --- Joining the paid channel --------------------------------------------------
 
@@ -183,7 +218,9 @@ STATUS_DISPUTED = (
 STATUS_INCOMPLETE ="Your checkout didn't finish. Tap /subscribe to try again."
 STATUS_GRANT = "🎟 Free access until <b>{end}</b>."
 STATUS_ENDED = "Your subscription has ended. Tap /subscribe to get instant alerts back."
-STATUS_NONE_TRIAL = "You haven't started your free trial yet. Tap /subscribe to start your free 2 weeks."
+STATUS_NONE_TRIAL_TEMPLATE = "You haven't started your free trial yet. Tap /subscribe to start your free {trial_length}."
+# The 14-day text, for callers that don't pass TRIAL_DAYS yet (format the template with trial_length).
+STATUS_NONE_TRIAL = STATUS_NONE_TRIAL_TEMPLATE.format(trial_length=trial_length(14))
 STATUS_NONE = "You don't have a subscription. Tap /subscribe to get instant alerts."
 
 # --- /help and /terms ----------------------------------------------------------

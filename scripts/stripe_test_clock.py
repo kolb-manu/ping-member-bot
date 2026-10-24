@@ -10,7 +10,9 @@ of goodbye message). Then it checks the result against what the bot is supposed 
   trial_start         trial begins, entitled, reminders fall due at the right times
   trial_paid          trial ends with a successful charge -> active, entitled, paid
   trial_failed        trial ends with a failed payment -> past_due, entitled only
-                      for the grace period, then the "trial ended" goodbye
+                      for the grace period, then the "trial ended" goodbye (also
+                      looked at 5 minutes after the trial end, when Stripe already
+                      says "active" before charging, so that can't pass for paid)
   cancel_in_trial     cancel at period end during the trial -> keeps access until
                       the trial would have ended, no reminders, never charged
   cancel_in_trial_now cancel immediately during the trial -> same promise
@@ -78,6 +80,9 @@ SLACK = timedelta(minutes=5)                    # tolerance when comparing Strip
 # Stripe finalises a renewal (or trial-conversion) invoice about an hour after
 # creating it at the period end, and charges it then.
 CHARGE_LAG = 2 * H
+# A look inside that hour, as the bot's 5-minute sync gets one: a trial that just
+# ended already reports "active" although nothing has been charged yet.
+DRAFT_LOOK = timedelta(minutes=5)
 # "About a month" for a renewed period: the shortest and longest calendar months.
 MONTH_MIN = timedelta(days=28) - SLACK
 MONTH_MAX = timedelta(days=31) + SLACK
@@ -232,6 +237,13 @@ async def _converted(s: Scenario) -> tuple[Observation, datetime]:
 async def _failed_conversion(s: Scenario) -> datetime:
     """Common start: the trial ends and the first charge fails. Returns the trial end."""
     _, end = await _begin(s, BAD_CARD)
+    # Stripe already says "active" here, while the first invoice is a draft, and the
+    # bot's 5-minute sync records that. It must not later count as a payment.
+    s.step("trial just ended, card not charged yet")
+    obs = await s.go(end + DRAFT_LOOK)
+    s.expect(obs.status in ("trialing", "active"), f"status is {obs.status!r}, want 'active' (or 'trialing')")
+    s.expect(obs.entitled, "entitled while the first invoice is a draft")
+    s.expect(not obs.early_reminder_due and not obs.final_reminder_due, "no trial reminders once the trial ended")
     s.step("trial ends, charge fails")
     obs = await s.go(end + CHARGE_LAG)
     s.expect(obs.status == "past_due", f"status is {obs.status!r}, want 'past_due'")
