@@ -197,6 +197,20 @@ HELP = (
     "/terms: the short version of the terms\n"
     "/help: this message"
 )
+# Added after HELP for ADMIN_IDS only. Everyone else sees exactly HELP.
+HELP_ADMIN = (
+    "<b>Admin</b>\n"
+    "/stats: users, trials, paying members and sign-ups\n"
+    "/user &lt;id or @username&gt;: everything about one user\n"
+    "/grant &lt;id or @username&gt; &lt;days&gt;: free access for that many days (0 clears it)\n"
+    "/revoke &lt;id or @username&gt;: clear a grant and remove them if nothing else gives access\n"
+    "/ban &lt;id or @username&gt;: block them for good and remove them\n"
+    "/unban &lt;id or @username&gt;: lift a ban\n"
+    "/dryrun: who the removal sweep would remove, without removing anyone\n"
+    "/confirmsweep: approve a sweep the mass-removal cap held back\n"
+    "/pause: hold all removals and reminders (joins and payments keep working)\n"
+    "/resume: switch removals and reminders back on"
+)
 
 # DRAFT: plain-English summary. The owner must check the final wording against
 # UK consumer rules (subscription and refund rules) before go-live.

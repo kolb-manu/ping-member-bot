@@ -314,6 +314,28 @@ async def test_terms_mentions_not_affiliated_and_price(svc):
     assert "£2.99/month" in msg.answers[0][0]
 
 
+async def test_help_for_everyone_else_is_unchanged(svc):
+    for uid in (1, 999):
+        msg = FakeMessage(uid)
+        await billing_handlers.cmd_help(msg, svc)
+        assert msg.answers == [(texts.HELP, None)]
+
+
+ADMIN_COMMANDS = ["/stats", "/user", "/grant", "/revoke", "/ban", "/unban", "/dryrun", "/confirmsweep",
+                  "/pause", "/resume"]
+
+
+@pytest.mark.parametrize("uid", [OWNER, 222])   # every ADMIN_IDS entry, not just the owner
+async def test_help_for_admins_adds_the_admin_commands(svc, uid):
+    msg = FakeMessage(uid)
+    await billing_handlers.cmd_help(msg, svc)
+    [(text, _)] = msg.answers
+    assert text == texts.HELP + "\n\n" + texts.HELP_ADMIN
+    admin_lines = texts.HELP_ADMIN.split("\n")[1:]
+    assert [line.split(":")[0].split()[0] for line in admin_lines] == ADMIN_COMMANDS   # one line each
+    assert "<id" not in texts.HELP_ADMIN          # angle brackets escaped for HTML parse mode
+
+
 # --- admin -------------------------------------------------------------------------
 
 async def test_admin_commands_ignored_for_non_admins(svc, tg):
@@ -324,11 +346,15 @@ async def test_admin_commands_ignored_for_non_admins(svc, tg):
         (admin_handlers.cmd_user, (cmd("user", "5"),)),
         (admin_handlers.cmd_grant, (cmd("grant", "5 30"),)),
         (admin_handlers.cmd_dryrun, ()),
+        (admin_handlers.cmd_confirmsweep, ()),
+        (admin_handlers.cmd_pause, ()),
+        (admin_handlers.cmd_resume, ()),
     ]:
         msg = FakeMessage(stranger)
         await handler(msg, *args, svc)
         assert msg.answers == []
     assert (await get_user(svc.db, 5)).manual_grant_until is None
+    assert await svc.db.kv_get("maintenance_paused_since") is None
     assert tg.events == []
 
 

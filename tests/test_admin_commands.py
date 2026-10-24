@@ -1,4 +1,4 @@
-"""/revoke, /ban and /unban (spec section 10)."""
+"""/revoke, /ban, /unban, /pause, /resume and /confirmsweep (spec section 10)."""
 from datetime import timedelta
 
 import pytest
@@ -8,6 +8,8 @@ from first_in_bot import admin
 from first_in_bot.billing import LAST_FULL_SYNC_KEY
 from first_in_bot.db import kv_set
 from first_in_bot.handlers import admin as admin_handlers
+from first_in_bot.maintenance import paused_since, set_paused
+from first_in_bot.sweep import CONFIRM_PROMPT, pending_confirm, sweep_removals
 from first_in_bot.timeutil import to_iso
 from first_in_bot.users import get_user
 from tests.fakes import NOW, OWNER, add_user, audit_actions, make_svc
@@ -175,3 +177,100 @@ async def test_banned_user_join_request_is_declined(real_svc, tg):
 
 def test_admin_target_error_is_a_value_error():
     assert issubclass(admin.AdminTarget, ValueError) and CommandObject is not None
+
+
+# --- /pause, /resume and /confirmsweep -----------------------------------------------------
+
+async def say(handler, svc, uid=OWNER):
+    msg = FakeMessage(uid)
+    await handler(msg, svc)
+    return [text for text, _ in msg.answers]
+
+
+@pytest.mark.parametrize("handler", [admin_handlers.cmd_pause, admin_handlers.cmd_resume,
+                                     admin_handlers.cmd_confirmsweep])
+async def test_maintenance_commands_ignored_for_non_admins(svc, tg, handler):
+    if handler is admin_handlers.cmd_resume:
+        await set_paused(svc.db, NOW, by=OWNER)   # so a stranger's /resume would have something to undo
+    before = await svc.db.fetchall("SELECT key, value FROM kv ORDER BY key")
+    assert await say(handler, svc, uid=999) == []
+    assert await svc.db.fetchall("SELECT key, value FROM kv ORDER BY key") == before
+    assert tg.events == []
+
+
+async def test_pause_says_what_is_and_isnt_paused(svc):
+    [reply] = await say(admin_handlers.cmd_pause, svc)
+    assert reply.startswith("⏸ Paused at 1 Nov 2026, 12:00.")
+    assert "removal sweep" in reply and "/revoke" in reply and "trial reminders" in reply
+    assert "Still running: join requests, checkout checks" in reply and "Stripe sync" in reply
+    assert "/dryrun still works" in reply and "/resume" in reply
+    assert await paused_since(svc.db) == NOW
+    [again] = await say(admin_handlers.cmd_pause, svc)
+    assert again.startswith("Already paused since 1 Nov 2026, 12:00")
+    assert (await audit_actions(svc.db)).count("pause") == 1
+
+
+async def test_resume_says_how_long_it_was_paused(svc):
+    assert "Not paused" in (await say(admin_handlers.cmd_resume, svc))[0]
+    await set_paused(svc.db, NOW - timedelta(hours=2, minutes=5), by=OWNER)
+    [reply] = await say(admin_handlers.cmd_resume, svc)
+    assert reply.startswith("▶️ Resumed after 2 hours 5 minutes (paused since 1 Nov 2026, 09:55).")
+    assert "still due go out" in reply and "/confirmsweep" in reply
+    assert await paused_since(svc.db) is None
+    assert "resume" in await audit_actions(svc.db)
+
+
+async def test_ban_while_paused_through_the_handler(real_svc, tg):
+    await add_user(real_svc.db, 5, in_paid_channel=True)
+    await say(admin_handlers.cmd_pause, real_svc)
+    [reply] = await run(admin_handlers.cmd_ban, real_svc, "ban", "5")
+    assert reply == "Banned 5. Paused, so I didn't remove them; the sweep will once you /resume."
+    assert (await get_user(real_svc.db, 5)).banned and tg.calls("kick") == []
+
+
+async def blocked(db, tg, stripe_fake):
+    svc = make_svc(db, tg, stripe_fake, REMOVALS_ENABLED="true", MAX_REMOVALS_PER_SWEEP="2")
+    async with db.tx() as conn:
+        await kv_set(conn, LAST_FULL_SYNC_KEY, to_iso(NOW - timedelta(minutes=5)))
+    for i in (10, 11, 12):
+        await add_user(db, i, in_paid_channel=True, manual_grant_until=NOW - D)
+    assert (await sweep_removals(svc, NOW)).blocked
+    return svc
+
+
+async def test_confirmsweep_command_removes_the_approved_set(db, tg, stripe_fake):
+    svc = await blocked(db, tg, stripe_fake)
+    [reply] = await say(admin_handlers.cmd_confirmsweep, svc)
+    assert "Removed (3): 10, 11, 12" in reply and sorted(tg.calls("kick")) == [10, 11, 12]
+    assert "Nothing is waiting" in (await say(admin_handlers.cmd_confirmsweep, svc))[0]
+
+
+async def test_confirmsweep_command_offers_the_new_report_once_sent(db, tg, stripe_fake):
+    svc = await blocked(db, tg, stripe_fake)
+    await add_user(db, 13, in_paid_channel=True, manual_grant_until=NOW - D)
+    [reply] = await say(admin_handlers.cmd_confirmsweep, svc)
+    assert reply.startswith("Not going ahead") and reply.endswith(CONFIRM_PROMPT)
+    assert (await pending_confirm(db)).ids == {10, 11, 12, 13}
+    await say(admin_handlers.cmd_confirmsweep, svc)
+    assert sorted(tg.calls("kick")) == [10, 11, 12, 13]
+
+
+async def test_confirmsweep_reply_that_never_arrived_offers_nothing(db, tg, stripe_fake):
+    svc = await blocked(db, tg, stripe_fake)
+    await add_user(db, 13, in_paid_channel=True, manual_grant_until=NOW - D)
+
+    class LostMessage(FakeMessage):
+        async def answer(self, text, reply_markup=None, **_):
+            raise RuntimeError("network down")
+
+    with pytest.raises(RuntimeError):
+        await admin_handlers.cmd_confirmsweep(LostMessage(OWNER), svc)
+    assert (await pending_confirm(db)).ids == {10, 11, 12}      # 13 was never shown to the owner
+    assert tg.calls("kick") == []
+
+
+async def test_confirmsweep_command_while_paused(db, tg, stripe_fake):
+    svc = await blocked(db, tg, stripe_fake)
+    await say(admin_handlers.cmd_pause, svc)
+    assert (await say(admin_handlers.cmd_confirmsweep, svc))[0].startswith("Paused: /resume first")
+    assert tg.calls("kick") == []

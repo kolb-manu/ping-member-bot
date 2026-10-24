@@ -1,4 +1,4 @@
-"""The removal sweep: dry run, safety rails and (for later) real mode."""
+"""The removal sweep: dry run, safety rails, real mode and /confirmsweep."""
 from datetime import timedelta
 
 import pytest
@@ -7,14 +7,21 @@ from first_in_bot import texts
 from first_in_bot.billing import LAST_FULL_SYNC_KEY
 from first_in_bot.db import kv_set
 from first_in_bot.admin import grant
+from first_in_bot.maintenance import clear_paused, set_paused
 from first_in_bot.models import User
 from first_in_bot.sweep import (
+    CONFIRM_KEY,
+    CONFIRM_PROMPT,
     FINGERPRINT_KEY,
+    NOT_BLOCKED_NOTE,
     REPORT_MAX_CHARS,
     SweepReport,
     cap_problem,
+    confirm_sweep,
     ended_kind,
     format_report,
+    offer_confirm,
+    pending_confirm,
     sweep_removals,
 )
 from first_in_bot.telegram_gateway import SendResult
@@ -23,6 +30,7 @@ from first_in_bot.users import get_user
 from tests.fakes import NOW, OWNER, FakeTelegram, add_user, audit_actions, make_svc
 
 D = timedelta(days=1)
+M = timedelta(minutes=1)
 
 TRIAL_OVER = dict(in_paid_channel=True, stripe_sub_id="sub_x", sub_status="canceled", trial_started_at=NOW - 15 * D,
                   sub_trial_end=NOW - D, sub_period_start=NOW - 15 * D, sub_period_end=NOW - D)
@@ -391,3 +399,270 @@ async def test_banned_user_is_removed_permanently_without_a_dm(real_svc, tg):
     await add_user(real_svc.db, 2, in_paid_channel=True, banned=True)
     report = await sweep_removals(real_svc, NOW)
     assert report.removed == [2] and tg.permanent_kicks == [2] and tg.sent_to(2) == []
+
+
+# --- /confirmsweep --------------------------------------------------------------------
+
+def capped_svc(db, tg, stripe_fake, removals=True):
+    env = {"MAX_REMOVALS_PER_SWEEP": "2"}
+    if removals:
+        env["REMOVALS_ENABLED"] = "true"
+    return make_svc(db, tg, stripe_fake, **env)
+
+
+async def blocked_sweep(svc, ids=(10, 11, 12)):
+    await fresh_sync(svc.db)
+    for i in ids:
+        await add_user(svc.db, i, **GRANT_OVER)
+    report = await sweep_removals(svc, NOW)
+    assert report.blocked and report.removed == []
+    return report
+
+
+def user_events(tg):
+    return [(e[0], e[1]) for e in tg.events if e[0] in ("send", "kick") and e[1] != OWNER]
+
+
+async def confirm_details(db):
+    rows = await db.fetchall("SELECT detail FROM audit_log WHERE action='sweep_confirm' ORDER BY id")
+    return [r["detail"] for r in rows]
+
+
+async def test_blocked_report_offers_confirm_and_stores_the_set(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc)
+    [dm] = tg.sent_to(OWNER)
+    assert "removals are held" in dm and dm.endswith("\n" + CONFIRM_PROMPT)
+    pending = await pending_confirm(db)
+    assert pending.ids == {10, 11, 12} and pending.at == NOW
+    assert await confirm_details(db) == ["offered: 10 11 12"]
+
+    # The same blocked state next tick: no new DM, and the offer (with its time) unchanged.
+    await sweep_removals(svc, NOW + 10 * M)
+    assert len(tg.sent_to(OWNER)) == 1 and (await pending_confirm(db)).at == NOW
+    assert await confirm_details(db) == ["offered: 10 11 12"]
+
+
+async def test_reports_that_arent_blocked_carry_no_confirm_prompt(svc, tg):
+    await fresh_sync(svc.db)
+    await add_user(svc.db, 2, **TRIAL_OVER)
+    await sweep_removals(svc, NOW)
+    assert CONFIRM_PROMPT not in tg.sent_to(OWNER)[0]
+    assert await pending_confirm(svc.db) is None
+
+
+async def test_offer_only_stored_once_the_report_is_delivered(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    tg.send_results[OWNER] = SendResult.FAILED
+    await blocked_sweep(svc)
+    assert await pending_confirm(db) is None
+    tg.send_results.clear()
+    await fresh_sync(db, at=NOW + 10 * M)
+    await sweep_removals(svc, NOW + 10 * M)
+    assert (await pending_confirm(db)).at == NOW + 10 * M
+
+
+@pytest.mark.parametrize("result", [SendResult.BLOCKED, SendResult.REJECTED])
+async def test_no_offer_when_the_owner_never_got_the_report(db, tg, stripe_fake, result):
+    svc = capped_svc(db, tg, stripe_fake)
+    tg.send_results[OWNER] = result
+    await blocked_sweep(svc)
+    assert await pending_confirm(db) is None
+
+
+async def test_confirm_removes_exactly_the_approved_set_once(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await add_user(db, 1, **PAYING)
+    await blocked_sweep(svc)
+    result = await confirm_sweep(svc, NOW + 5 * M, by=OWNER)
+    assert result.offer is None
+    assert user_events(tg) == [("send", 10), ("kick", 10), ("send", 11), ("kick", 11), ("send", 12), ("kick", 12)]
+    assert all(tg.sent_to(i) == [texts.ACCESS_ENDED] for i in (10, 11, 12))
+    assert "cap lifted by /confirmsweep" in result.text and "Removed (3): 10, 11, 12" in result.text
+    assert "Blocked" not in result.text
+    for i in (10, 11, 12):
+        assert not (await get_user(db, i)).in_paid_channel and "removed" in await audit_actions(db, i)
+    assert (await get_user(db, 1)).in_paid_channel
+    assert await pending_confirm(db) is None
+    assert await confirm_details(db) == ["offered: 10 11 12", f"approved by={OWNER}: 10 11 12"]
+
+    again = await confirm_sweep(svc, NOW + 6 * M, by=OWNER)
+    assert "Nothing is waiting for /confirmsweep" in again.text
+    assert len(tg.calls("kick")) == 3
+
+
+async def test_confirm_goes_ahead_when_fewer_people_are_left(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc)
+    await grant(db, User(telegram_id=11), 30, NOW, by=OWNER)       # 11 got access back meanwhile
+    result = await confirm_sweep(svc, NOW + 5 * M, by=OWNER)
+    assert sorted(tg.calls("kick")) == [10, 12] and tg.sent_to(11) == []
+    assert "Removed (2): 10, 12" in result.text
+
+
+async def test_confirm_refuses_when_someone_new_would_be_removed(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc)
+    await add_user(db, 13, **GRANT_OVER)
+    result = await confirm_sweep(svc, NOW + 5 * M, by=OWNER)
+    assert tg.calls("kick") == [] and user_events(tg) == []
+    assert result.text.startswith("Not going ahead: 1 of the people")
+    assert "Would remove (4)" in result.text and "13 @user13" in result.text
+    assert result.text.endswith(CONFIRM_PROMPT) and result.offer is not None
+    assert (await pending_confirm(db)).ids == {10, 11, 12}   # the handler stores the new offer once it's sent
+    assert f"refused (not approved: 13) by={OWNER}" in await confirm_details(db)
+
+    # Once the owner has the new report, they can approve that one.
+    await offer_confirm(svc, result.offer, NOW + 6 * M)
+    await confirm_sweep(svc, NOW + 7 * M, by=OWNER)
+    assert sorted(tg.calls("kick")) == [10, 11, 12, 13]
+
+
+async def test_confirm_refuses_new_people_when_the_cap_no_longer_blocks(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc)
+    for i in (10, 11, 12):
+        await grant(db, User(telegram_id=i), 30, NOW, by=OWNER)
+    await add_user(db, 13, **GRANT_OVER)
+    result = await confirm_sweep(svc, NOW + 5 * M, by=OWNER)
+    assert tg.calls("kick") == [] and result.offer is None
+    assert NOT_BLOCKED_NOTE in result.text and CONFIRM_PROMPT not in result.text
+    assert await pending_confirm(db) is None
+
+
+@pytest.mark.parametrize("after,goes_ahead", [
+    (timedelta(minutes=59, seconds=59), True),
+    (timedelta(hours=1), False),
+    (timedelta(hours=5), False),
+    (-M, False),                       # an offer from the future: the clock moved, so don't trust it
+])
+async def test_confirm_expires_after_an_hour(db, tg, stripe_fake, after, goes_ahead):
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc)
+    await fresh_sync(db, at=NOW + after)
+    result = await confirm_sweep(svc, NOW + after, by=OWNER)
+    assert bool(tg.calls("kick")) is goes_ahead
+    if not goes_ahead:
+        assert result.text.startswith("That approval has expired") and result.text.endswith(CONFIRM_PROMPT)
+        assert result.offer is not None and (await pending_confirm(db)).at == NOW
+
+
+async def test_confirm_dry_run_shows_the_flow_and_removes_nobody(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake, removals=False)
+    await blocked_sweep(svc)
+    assert tg.sent_to(OWNER)[0].endswith(CONFIRM_PROMPT)
+    result = await confirm_sweep(svc, NOW + 5 * M, by=OWNER)
+    assert result.text.startswith("🧹 Dry run: with the cap lifted I would remove 3: 10 @user10 (free access ended)")
+    assert "Nobody was removed because REMOVALS_ENABLED=false" in result.text
+    assert tg.calls("kick") == [] and user_events(tg) == []
+    for i in (10, 11, 12):
+        assert (await get_user(db, i)).in_paid_channel
+    assert await pending_confirm(db) is None
+    assert f"approved (dry run) by={OWNER}: 10 11 12" in await confirm_details(db)
+    assert "Nothing is waiting" in (await confirm_sweep(svc, NOW + 6 * M, by=OWNER)).text
+
+
+async def test_confirm_refused_while_paused(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc)
+    await set_paused(db, NOW + M, by=OWNER)
+    lookups = len(tg.calls("status"))
+    result = await confirm_sweep(svc, NOW + 2 * M, by=OWNER)
+    assert result.text.startswith("Paused: /resume first")
+    assert len(tg.calls("status")) == lookups and tg.calls("kick") == []
+    assert await pending_confirm(db) is not None
+    await clear_paused(db, NOW + 3 * M, by=OWNER)
+    await confirm_sweep(svc, NOW + 4 * M, by=OWNER)
+    assert sorted(tg.calls("kick")) == [10, 11, 12]
+
+
+async def test_confirm_with_nothing_pending(svc, tg):
+    result = await confirm_sweep(svc, NOW, by=OWNER)
+    assert result.text.startswith("Nothing is waiting for /confirmsweep") and result.offer is None
+    assert tg.events == []
+    assert await confirm_details(svc.db) == [f"refused (nothing pending) by={OWNER}"]
+
+
+async def test_unreadable_offer_counts_as_nothing_pending(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc)
+    async with db.tx() as conn:
+        await kv_set(conn, CONFIRM_KEY, "{not json")
+    assert "Nothing is waiting" in (await confirm_sweep(svc, NOW + M, by=OWNER)).text
+    assert tg.calls("kick") == []
+
+
+async def test_confirm_keeps_every_other_check(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await fresh_sync(db)
+    await add_user(db, 10, **GRANT_OVER)
+    await add_user(db, 11, **GRANT_OVER)
+    await add_user(db, 12, **TRIAL_OVER)
+    await add_user(db, 13, **GRANT_OVER)
+    await sweep_removals(svc, NOW)
+    assert (await pending_confirm(db)).ids == {10, 11, 12, 13}
+    tg.statuses[11] = "administrator"
+    tg.statuses[13] = None
+    # 20 minutes after the last sync it's stale, so the subscriber (12) mustn't go.
+    result = await confirm_sweep(svc, NOW + 15 * M, by=OWNER)
+    assert tg.calls("kick") == [10]
+    assert "channel admin" in result.text and "Stripe sync is stale" in result.text
+    assert "couldn't check membership" in result.text
+    assert (await get_user(db, 12)).in_paid_channel and (await get_user(db, 13)).in_paid_channel
+
+
+async def test_confirm_rechecks_each_person_before_the_kick(db, stripe_fake):
+    tg = GrantingTelegram(db, "dm")      # each goodbye DM is followed by a /grant landing
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc)
+    result = await confirm_sweep(svc, NOW + 5 * M, by=OWNER)
+    assert tg.calls("kick") == []
+    assert "became entitled during the sweep" in result.text
+    for i in (10, 11, 12):
+        assert (await get_user(db, i)).in_paid_channel
+
+
+async def test_confirm_never_removes_an_admin(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc, ids=(10, 11, 12, 222))
+    assert (await pending_confirm(db)).ids == {10, 11, 12}
+    await confirm_sweep(svc, NOW + 5 * M, by=OWNER)
+    assert 222 not in tg.calls("kick") and 222 not in tg.calls("status")
+
+
+async def test_an_approval_is_used_only_once_even_when_replaced_mid_check(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc)
+    real_status = tg.member_status
+
+    async def newer_offer_meanwhile(user_id):
+        async with db.tx() as conn:   # e.g. a double tap, or a newer report delivered
+            await kv_set(conn, CONFIRM_KEY, '{"ids": [10, 11, 12], "at": "2026-11-01T12:04:00+00:00"}')
+        return await real_status(user_id)
+
+    tg.member_status = newer_offer_meanwhile
+    result = await confirm_sweep(svc, NOW + 5 * M, by=OWNER)
+    assert "just used or replaced" in result.text and tg.calls("kick") == []
+
+
+async def test_a_sweep_that_is_no_longer_blocked_drops_the_offer(db, tg, stripe_fake):
+    svc = capped_svc(db, tg, stripe_fake)
+    await blocked_sweep(svc)
+    for i in (11, 12):
+        await grant(db, User(telegram_id=i), 30, NOW, by=OWNER)
+    report = await sweep_removals(svc, NOW + 10 * M)
+    assert report.removed == [10]                               # under the cap: the sweep does it itself
+    assert await pending_confirm(db) is None
+    assert await confirm_details(db) == ["offered: 10 11 12", "dropped: sweep no longer blocked"]
+    await sweep_removals(svc, NOW + 20 * M)
+    assert len(await confirm_details(db)) == 2                  # nothing written on quiet ticks
+
+
+def test_confirm_prompt_survives_a_cut_report():
+    def u(i):
+        return User(telegram_id=10**12 + i, first_name="Ä&<😀" * 16, manual_grant_until=NOW - D)
+    report = SweepReport(dry_run=False, would_remove=[u(i) for i in range(60)],
+                         skipped=[(u(i), "stale_sync") for i in range(60)], blocked="60 removals is too many")
+    text = format_report(report, offer_confirm=True)
+    assert len(text.encode("utf-16-le")) // 2 <= REPORT_MAX_CHARS
+    assert text.endswith("(cut short)\n" + CONFIRM_PROMPT)

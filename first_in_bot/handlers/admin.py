@@ -1,5 +1,5 @@
-"""Admin commands: /stats, /user, /grant, /revoke, /ban, /unban, /dryrun. Only for ADMIN_IDS; anyone
-else gets no reply at all."""
+"""Admin commands: /stats, /user, /grant, /revoke, /ban, /unban, /dryrun, /confirmsweep, /pause
+and /resume. Only for ADMIN_IDS; anyone else gets no reply at all."""
 from __future__ import annotations
 
 import html
@@ -10,7 +10,7 @@ from aiogram.types import Message
 
 from .. import admin
 from ..services import Services
-from ..sweep import format_report, sweep_removals
+from ..sweep import confirm_sweep, format_report, offer_confirm, sweep_removals
 from ..timeutil import format_local
 from ..users import find_user
 
@@ -111,3 +111,28 @@ async def cmd_dryrun(message: Message, svc: Services) -> None:
         return
     report = await sweep_removals(svc, svc.now(), force_dry_run=True)
     await message.answer(format_report(report))
+
+
+@router.message(Command("confirmsweep"))
+async def cmd_confirmsweep(message: Message, svc: Services) -> None:
+    if not is_admin(message, svc) or message.from_user is None:
+        return
+    result = await confirm_sweep(svc, svc.now(), by=message.from_user.id)
+    await message.answer(result.text)
+    if result.offer is not None:
+        # Only once the owner has the new report: an approval must match what they saw.
+        await offer_confirm(svc, result.offer, svc.now())
+
+
+@router.message(Command("pause"))
+async def cmd_pause(message: Message, svc: Services) -> None:
+    if not is_admin(message, svc) or message.from_user is None:
+        return
+    await message.answer(await admin.pause(svc, svc.now(), by=message.from_user.id))
+
+
+@router.message(Command("resume"))
+async def cmd_resume(message: Message, svc: Services) -> None:
+    if not is_admin(message, svc) or message.from_user is None:
+        return
+    await message.answer(await admin.resume(svc, svc.now(), by=message.from_user.id))

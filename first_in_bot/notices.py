@@ -16,6 +16,7 @@ from aiogram.types import InlineKeyboardMarkup
 
 from . import texts
 from .keyboards import manage_keyboard
+from .maintenance import paused_since
 from .models import User
 from .services import Services
 from .telegram_gateway import SendResult
@@ -122,7 +123,15 @@ def trial_final_due(user: User, now: datetime) -> bool:
 async def send_notices(svc: Services, now: datetime) -> int:
     """Scheduler job. Returns how many notices went out. Each kind is sent at most
     once per trial (the cycle key is the trial end), and never to someone who has
-    cancelled."""
+    cancelled.
+
+    While paused (/pause) it sends and records nothing. After /resume the due rules
+    above decide, as after downtime: a reminder whose window has passed (the trial
+    ended, or the last-day window began) is never sent late."""
+    since = await paused_since(svc.db)
+    if since is not None:
+        log.info("Notices: paused since %s, sending nothing", to_iso(since))
+        return 0
     rows = await svc.db.fetchall(
         "SELECT * FROM users WHERE sub_status='trialing' AND sub_trial_end IS NOT NULL "
         "AND cancel_at_period_end=0 AND blocked_bot=0 AND banned=0"

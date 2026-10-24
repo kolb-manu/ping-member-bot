@@ -4,11 +4,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from first_in_bot.maintenance import clear_paused, set_paused
 from first_in_bot.notices import send_notices
 from first_in_bot.telegram_gateway import SendResult
 from first_in_bot.timeutil import to_iso
 from first_in_bot.users import get_user
-from tests.fakes import NOW, add_user, make_svc
+from tests.fakes import NOW, OWNER, add_user, make_svc
 
 H = timedelta(hours=1)
 
@@ -188,3 +189,46 @@ async def test_each_trial_cycle_gets_its_own_notices(svc, tg):
         await conn.execute("UPDATE users SET sub_trial_end=? WHERE telegram_id=1", (to_iso(new_end),))
     assert await send_notices(svc, new_end - timedelta(hours=1)) == 1
     assert len(tg.sent_to(1)) == 2
+
+
+# --- /pause -------------------------------------------------------------------------
+
+async def test_nothing_sent_or_recorded_while_paused(svc, tg):
+    await add_user(svc.db, 1, **trialing(NOW + timedelta(days=1)))
+    await add_user(svc.db, 2, **trialing(NOW + H))
+    await set_paused(svc.db, NOW - H, by=OWNER)
+    for minutes in (0, 5, 10):
+        assert await send_notices(svc, NOW + timedelta(minutes=minutes)) == 0
+    assert tg.events == [] and await notice_rows(svc.db) == []
+
+
+@pytest.mark.parametrize("resumed_at,kinds", [
+    # Resumed while the early reminder is still due: it goes out as normal.
+    (NOW + timedelta(days=1), ["trial_reminder"]),
+    # Paused through the early window into the last few hours: only the final one goes.
+    (NOW + timedelta(days=2, hours=22), ["trial_final"]),
+    # Paused past the first charge: nothing is sent late.
+    (NOW + timedelta(days=3, minutes=1), []),
+])
+async def test_after_resume_only_still_relevant_reminders_go_out(svc, tg, resumed_at, kinds):
+    end = NOW + timedelta(days=3)
+    await add_user(svc.db, 1, **trialing(end))
+    await set_paused(svc.db, NOW, by=OWNER)
+    t = NOW
+    while t < resumed_at:
+        assert await send_notices(svc, t) == 0
+        t += timedelta(hours=6)
+    await clear_paused(svc.db, resumed_at, by=OWNER)
+    await send_notices(svc, resumed_at)
+    await send_notices(svc, resumed_at + timedelta(minutes=5))   # the next tick adds nothing
+    assert await kinds_sent(svc.db) == kinds
+    assert len(tg.sent_to(1)) == len(kinds)
+
+
+async def test_cancelled_while_paused_gets_no_reminder_after_resume(svc, tg):
+    await add_user(svc.db, 1, **trialing(NOW + timedelta(days=1)))
+    await set_paused(svc.db, NOW, by=OWNER)
+    async with svc.db.tx() as conn:
+        await conn.execute("UPDATE users SET cancel_at_period_end=1 WHERE telegram_id=1")
+    await clear_paused(svc.db, NOW + H, by=OWNER)
+    assert await send_notices(svc, NOW + H) == 0 and tg.events == []

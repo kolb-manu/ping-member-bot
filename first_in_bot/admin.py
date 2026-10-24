@@ -1,5 +1,6 @@
-"""Owner/admin tools: /stats, /user, /grant. Handlers check ADMIN_IDS first.
-Every value that came from a user or the DB is HTML-escaped before display."""
+"""Owner/admin tools: /stats, /user, /grant, /revoke, /ban, /unban, /pause and
+/resume. Handlers check ADMIN_IDS first. Every value that came from a user or
+the DB is HTML-escaped before display."""
 from __future__ import annotations
 
 import html
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from .audit import audit
 from .db import Database
+from .maintenance import clear_paused, describe_duration, paused_since, set_paused
 from .models import User
 from .services import Services
 from .sweep import remove_one
@@ -140,3 +142,36 @@ async def unban(svc: Services, user: User, now: datetime, by: int) -> str:
     lifted = await svc.tg.unban(user.telegram_id)
     note = "" if lifted else " I couldn't lift the Telegram ban, so they may still be blocked from rejoining."
     return f"Unbanned {user.telegram_id}. They still need a trial, grant or subscription to get in.{note}"
+
+
+PAUSE_SCOPE = (
+    "Paused: the removal sweep (nobody is removed or sent a goodbye message), removals from /revoke "
+    "and /ban (they still set their flags), and the trial reminders.\n"
+    "Still running: join requests, checkout checks, the \"You're in\" message and the Stripe sync, "
+    "so paying people still get in. /dryrun still works."
+)
+
+
+async def pause(svc: Services, now: datetime, by: int) -> str:
+    """/pause: hold removals and reminders until /resume (see maintenance.py)."""
+    tz = svc.config.timezone
+    if not await set_paused(svc.db, now, by):
+        since = await paused_since(svc.db)
+        when = f" since {format_local(since, tz)}" if since else ""
+        return f"Already paused{when}. /resume switches removals and reminders back on."
+    return f"⏸ Paused at {format_local(now, tz)}.\n{PAUSE_SCOPE}\n/resume switches it all back on."
+
+
+async def resume(svc: Services, now: datetime, by: int) -> str:
+    since = await paused_since(svc.db)
+    if not await clear_paused(svc.db, now, by):
+        return "Not paused, so there was nothing to resume."
+    took = ""
+    if since is not None:
+        took = f" after {describe_duration(now - since)} (paused since {format_local(since, svc.config.timezone)})"
+    return (
+        f"▶️ Resumed{took}.\n"
+        "The removal sweep and reminders run again on their next tick. Reminders that are still due go out "
+        "then; ones whose moment has passed are skipped. If a lot of people lost access while paused, the "
+        "mass-removal cap may hold the sweep back for /confirmsweep."
+    )
