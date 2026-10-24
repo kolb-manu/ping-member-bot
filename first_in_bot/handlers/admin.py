@@ -1,5 +1,5 @@
-"""Admin commands: /stats, /user, /grant, /revoke, /ban, /unban, /dryrun, /confirmsweep, /pause
-and /resume. Only for ADMIN_IDS; anyone else gets no reply at all."""
+"""Admin commands: /stats, /report, /user, /grant, /revoke, /ban, /unban, /dryrun, /confirmsweep,
+/pause and /resume. Only for ADMIN_IDS; anyone else gets no reply at all."""
 from __future__ import annotations
 
 import html
@@ -9,8 +9,10 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
 from .. import admin
+from ..report import report_text
+from ..scheduler import JobHealthStore
 from ..services import Services
-from ..sweep import confirm_sweep, format_report, offer_confirm, sweep_removals
+from ..sweep import _fit, confirm_sweep, format_report, offer_confirm, sweep_removals
 from ..timeutil import format_local
 from ..users import find_user
 
@@ -29,6 +31,15 @@ async def cmd_stats(message: Message, svc: Services) -> None:
     if not is_admin(message, svc):
         return
     await message.answer(await admin.stats_text(svc.db, svc.now()))
+
+
+@router.message(Command("report"))
+async def cmd_report(message: Message, svc: Services) -> None:
+    """The daily report on demand. Unlike the 09:00 one it resets no failure counts."""
+    if not is_admin(message, svc):
+        return
+    health = await JobHealthStore(svc.db).snapshot()
+    await message.answer(_fit(await report_text(svc, svc.now(), health)))
 
 
 @router.message(Command("user"))

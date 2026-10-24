@@ -96,14 +96,15 @@ async def test_runs_of_one_job_never_overlap():
 
 async def test_job_list_depends_on_stripe(db, stripe_fake):
     no_stripe = [j.name for j in build_jobs(make_svc(db, FakeTelegram(), None))]
-    assert no_stripe == ["send_notices", "sweep_removals", "daily_report"]
+    assert no_stripe == ["send_notices", "sweep_removals", "daily_report", "backup"]
     jobs = {j.name: j for j in build_jobs(make_svc(db, FakeTelegram(), stripe_fake))}
     assert set(jobs) == {"sync_subscriptions", "poll_checkouts", "check_disputes", "send_notices",
-                         "sweep_removals", "daily_report"}
+                         "sweep_removals", "daily_report", "backup"}
     assert jobs["check_disputes"].interval == 86400
     assert jobs["poll_checkouts"].interval == 30 and jobs["sweep_removals"].interval == 600
     assert jobs["sync_subscriptions"].initial_delay < jobs["sweep_removals"].initial_delay
     assert jobs["daily_report"].interval == 60 and jobs["daily_report"].initial_delay == 60
+    assert jobs["backup"].interval == 60
     # Stripe blips are normal: only a run of three failures alerts. Everything else alerts at once.
     assert {name: j.alert_after for name, j in jobs.items() if j.alert_after != 1} == {
         "sync_subscriptions": 3, "poll_checkouts": 3}

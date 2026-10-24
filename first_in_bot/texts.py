@@ -201,6 +201,7 @@ HELP = (
 HELP_ADMIN = (
     "<b>Admin</b>\n"
     "/stats: users, trials, paying members and sign-ups\n"
+    "/report: the 09:00 daily report, now (stats, job health, backups, modes)\n"
     "/user &lt;id or @username&gt;: everything about one user\n"
     "/grant &lt;id or @username&gt; &lt;days&gt;: free access for that many days (0 clears it)\n"
     "/revoke &lt;id or @username&gt;: clear a grant and remove them if nothing else gives access\n"

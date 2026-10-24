@@ -290,7 +290,23 @@ def test_scrub_hides_tokens_and_keys():
 
 async def test_run_checks_in_order(workdir):
     checks = await preflight.run_checks(make_config(), FakeBot(), FakeRights(), FakePrice(), "backups")
-    assert [c.name for c in checks] == ["Database", "Telegram", "Paid channel", "Stripe", "Removals", "Backups"]
+    assert [c.name for c in checks] == ["Running copy", "Database", "Telegram", "Paid channel", "Stripe",
+                                        "Removals", "Backups"]
+    assert checks[0].status is Status.PASS
+
+
+async def test_run_checks_skips_the_database_while_the_bot_runs(workdir):
+    from first_in_bot.lock import acquire_instance_lock, lock_path_for
+
+    config = make_config()
+    with acquire_instance_lock(lock_path_for(config.db_path)):
+        checks = await preflight.run_checks(config, FakeBot(), FakeRights(), FakePrice(), "backups")
+        assert checks[0].status is Status.WARN and "already running" in checks[0].detail
+        assert "Database" not in [c.name for c in checks]
+        assert not (workdir / "data" / "first-in.db").exists()   # no migrations under a running bot
+    # Released afterwards when it took the lock itself: the bot can start straight after.
+    checks = await preflight.run_checks(config, FakeBot(), FakeRights(), FakePrice(), "backups")
+    acquire_instance_lock(lock_path_for(config.db_path)).release()
 
 
 def test_report_counts_and_verdict(capsys):
@@ -325,7 +341,8 @@ async def test_full_run_passes_with_real_gateways_and_closes_the_session(workdir
     assert "[FAIL]" not in out and "[WARN]" not in out
     assert "[PASS] Stripe: TEST mode, price_123 is £2.99/month" in out
     assert "[PASS] Removals: REMOVALS_ENABLED=false" in out
-    assert "8 passed, 0 warnings, 0 failed" in out
+    assert "[PASS] Running copy: no other copy is running" in out
+    assert "9 passed, 0 warnings, 0 failed" in out
     assert TOKEN not in out and TOKEN.split(":")[1] not in out and STRIPE_KEY not in out
     assert session.closed
     # Only lookups: never getUpdates, so a running copy isn't disturbed.

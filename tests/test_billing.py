@@ -519,9 +519,22 @@ async def test_multiple_live_subscriptions_alert_the_owner_rate_limited(svc, str
     assert "More than one live subscription" in alert
     assert "user 1: sub_a, sub_b\nuser 2: sub_c, sub_d" in alert       # one DM for everyone
     await sync_subscriptions(svc, NOW + 5 * M)
-    assert len(tg.sent_to(OWNER)) == 1
     await sync_subscriptions(svc, NOW + 30 * M)
-    assert len(tg.sent_to(OWNER)) == 2                                  # a reminder while it lasts
+    assert len(tg.sent_to(OWNER)) == 1                                  # not every sync, nor every 30 min
+    await sync_subscriptions(svc, NOW + 24 * 60 * M)
+    assert len(tg.sent_to(OWNER)) == 2                                  # a daily reminder while it lasts
+
+
+async def test_a_new_duplicate_is_alerted_at_once(svc, stripe_fake, tg):
+    await add_user(svc.db, 1)
+    await add_user(svc.db, 2)
+    stripe_fake.subscriptions = [sub_info(id="sub_a"), sub_info(id="sub_b", created=NOW + M)]
+    await sync_subscriptions(svc, NOW)
+    stripe_fake.subscriptions += [sub_info(id="sub_c", telegram_id=2, customer="cus_2"),
+                                  sub_info(id="sub_d", telegram_id=2, customer="cus_2", created=NOW + M)]
+    await sync_subscriptions(svc, NOW + 5 * M)
+    first, second = tg.sent_to(OWNER)
+    assert "user 2" not in first and "user 2: sub_c, sub_d" in second
 
 
 async def test_subscription_gone_from_stripe_alerts_once(svc, stripe_fake, tg):

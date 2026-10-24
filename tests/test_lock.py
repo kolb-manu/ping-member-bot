@@ -109,3 +109,27 @@ def test_lock_path_sits_next_to_the_database(tmp_path, monkeypatch):
     assert lock_path_for("first-in.db") == str(tmp_path.resolve() / "first-in-member-bot.lock")
     # No folder for an in-memory database, so the working directory.
     assert lock_path_for(":memory:") == str(tmp_path.resolve() / "first-in-member-bot.lock")
+
+
+# --- main() takes the lock before anything else ------------------------------------
+
+def test_main_exits_when_another_copy_holds_the_lock(tmp_path, monkeypatch, capsys):
+    from first_in_bot import main as main_module
+    from first_in_bot.lock import acquire_instance_lock, lock_path_for
+    from tests.test_config import GOOD
+
+    db_path = str(tmp_path / "data" / "first-in.db")
+    # Never read the real .env, and never get as far as the bot.
+    monkeypatch.setattr(main_module, "load_dotenv", lambda: None)
+    monkeypatch.setattr(main_module.os, "environ", {**GOOD, "DB_PATH": db_path})
+
+    def must_not_run(config):
+        raise AssertionError("the bot started next to a running copy")
+
+    monkeypatch.setattr(main_module, "run", must_not_run)
+    with acquire_instance_lock(lock_path_for(db_path)):
+        with pytest.raises(SystemExit) as exc:
+            main_module.main()
+    assert exc.value.code == 3
+    assert "already running" in capsys.readouterr().err
+    assert not (tmp_path / "data" / "first-in.db").exists()

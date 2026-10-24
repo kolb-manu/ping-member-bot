@@ -1,5 +1,6 @@
 """Entry point: load config, open the DB, wire up gateways, handlers and the
-background jobs, then long-poll Telegram until stopped.
+background jobs, then long-poll Telegram until stopped. A lock file next to the
+database (lock.py) makes sure only one copy runs on this machine.
 
 Shutdown (SIGTERM from systemd, or Ctrl+C): aiogram's start_polling handles both
 signals by stopping polling and returning. Then, in this order, the scheduler
@@ -25,7 +26,8 @@ from .config import ConfigError, Config, load_config
 from .db import Database
 from .handlers import admin, billing, channel, start
 from .handlers.middleware import UnblockMiddleware
-from .report import mode_lines
+from .lock import AlreadyRunning, acquire_instance_lock, lock_path_for
+from .report import mode_lines, state_lines
 from .scheduler import Scheduler, build_jobs
 from .services import Services
 from .stripe_gateway import StripeGateway
@@ -67,8 +69,8 @@ def build_dispatcher(svc: Services) -> Dispatcher:
     return dp
 
 
-def startup_text(svc: Services, rights_problems: list[str]) -> str:
-    lines = ["🟢 <b>First In member bot started</b>", *mode_lines(svc)]
+def startup_text(svc: Services, rights_problems: list[str], state: list[str] | None = None) -> str:
+    lines = ["🟢 <b>First In member bot started</b>", *mode_lines(svc), *(state or [])]
     if rights_problems:
         lines.append("⚠️ Paid channel setup:")
         lines += [f"• {html.escape(problem)}" for problem in rights_problems]
@@ -98,7 +100,8 @@ async def run(config: Config) -> None:
         log.info("Starting @%s | Stripe: %s | removals enabled: %s",
                  me.username, config.stripe_mode if stripe_gw else "off", config.removals_enabled)
         # Rate-limited like every alert, so a restart loop doesn't flood the owner.
-        await alert_owner(svc, "startup", startup_text(svc, problems), svc.now())
+        now = svc.now()
+        await alert_owner(svc, "startup", startup_text(svc, problems, await state_lines(svc, now)), now)
         scheduler_task = asyncio.create_task(scheduler.run(), name="scheduler")
         # The session is closed below, after the scheduler, not by aiogram.
         await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES, close_bot_session=False)
@@ -123,4 +126,11 @@ def main() -> None:
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         sys.exit(2)
-    asyncio.run(run(config))
+    # Before the DB is opened: a second copy must not touch it or poll Telegram at all.
+    try:
+        lock = acquire_instance_lock(lock_path_for(config.db_path))
+    except AlreadyRunning as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(3)
+    with lock:
+        asyncio.run(run(config))

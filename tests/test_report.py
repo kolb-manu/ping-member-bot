@@ -166,3 +166,47 @@ async def test_a_long_report_fits_in_one_message(svc, tg):
     [text] = tg.sent_to(OWNER)
     assert len(text.encode("utf-16-le")) // 2 <= 4096 and text.endswith("(cut short)")
     assert source.resets == [health]
+
+
+# --- pause, held-back sweep and backups --------------------------------------------------
+
+async def test_report_shows_the_pause_and_a_held_back_sweep(svc):
+    from first_in_bot.maintenance import set_paused
+    from first_in_bot.sweep import CONFIRM_KEY
+
+    await set_paused(svc.db, MORNING - 26 * H, by=OWNER)
+    async with svc.db.tx() as conn:
+        await kv_set(conn, CONFIRM_KEY, '{"ids": [5, 6, 7], "at": "%s"}' % to_iso(MORNING - 10 * M))
+    text = await report_text(svc, MORNING, {})
+    assert "⏸ Paused since 1 Nov 2026, 07:00 (1 day 2 hours)" in text
+    assert "holding back 3 removals: /confirmsweep" in text
+
+
+async def test_report_leaves_out_an_expired_confirm_and_shows_backups(svc):
+    from first_in_bot.backup import BACKUP_DATE_KEY, BACKUP_FAILED_KEY
+    from first_in_bot.sweep import CONFIRM_KEY
+
+    async with svc.db.tx() as conn:
+        await kv_set(conn, CONFIRM_KEY, '{"ids": [5], "at": "%s"}' % to_iso(MORNING - 2 * H))
+    text = await report_text(svc, MORNING, {})
+    assert "Paused" not in text and "/confirmsweep" not in text
+    assert "Last backup: none yet" in text
+    async with svc.db.tx() as conn:
+        await kv_set(conn, BACKUP_DATE_KEY, "2026-11-02")
+    assert "Last backup: 2026-11-02" in await report_text(svc, MORNING, {})
+    async with svc.db.tx() as conn:
+        await kv_set(conn, BACKUP_FAILED_KEY, to_iso(MORNING - 5 * H))
+    assert "⚠️ Last backup attempt failed at 2 Nov 2026, 04:00" in await report_text(svc, MORNING, {})
+
+
+async def test_report_command_is_the_report_without_resetting_counts(svc):
+    from tests.test_handlers import FakeMessage
+    from first_in_bot.handlers import admin as admin_handlers
+
+    store = JobHealthStore(svc.db)
+    await store.update("send_notices", lambda h: h.failed(MORNING, "Boom"))
+    msg = FakeMessage(OWNER)
+    await admin_handlers.cmd_report(msg, svc)
+    [(text, _)] = msg.answers
+    assert "First In daily report" in text and "send_notices" in text
+    assert (await store.get("send_notices")).failures_since_report == 1

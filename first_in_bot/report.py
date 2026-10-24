@@ -17,10 +17,12 @@ from zoneinfo import ZoneInfo
 
 from .admin import stats_text
 from .alerts import send_owner
+from .backup import BACKUP_DATE_KEY, BACKUP_FAILED_KEY
 from .billing import LAST_FULL_SYNC_KEY
 from .daily import daily_due, mark_done
+from .maintenance import describe_duration, paused_since
 from .services import Services
-from .sweep import SYNC_MAX_AGE, _fit
+from .sweep import CONFIRM_TTL, SYNC_MAX_AGE, _fit, pending_confirm
 from .telegram_gateway import SendResult
 from .timeutil import format_local, format_local_date, from_iso
 
@@ -85,6 +87,29 @@ async def sync_line(svc: Services, now: datetime) -> str | None:
     return f"Last full Stripe sync: {_ago(now - last)} ago"
 
 
+async def state_lines(svc: Services, now: datetime) -> list[str]:
+    """What the owner switched on, or has to act on. Also used by the startup alert."""
+    tz = svc.config.timezone
+    lines = []
+    since = await paused_since(svc.db)
+    if since is not None:
+        lines.append(f"⏸ Paused since {format_local(since, tz)} ({describe_duration(now - since)}): "
+                     "nobody is removed and no reminders go out until /resume")
+    pending = await pending_confirm(svc.db)
+    if pending is not None and timedelta(0) <= now - pending.at < CONFIRM_TTL:
+        lines.append(f"⛔ The mass-removal cap is holding back {len(pending.ids)} removals: "
+                     "/confirmsweep to go ahead, /dryrun to look first")
+    return lines
+
+
+async def backup_line(svc: Services) -> str:
+    failed = from_iso(await svc.db.kv_get(BACKUP_FAILED_KEY))
+    if failed is not None:
+        return f"⚠️ Last backup attempt failed at {format_local(failed, svc.config.timezone)}"
+    last = await svc.db.kv_get(BACKUP_DATE_KEY)
+    return f"Last backup: {last}" if last else "Last backup: none yet"
+
+
 def mode_lines(svc: Services) -> list[str]:
     """Also used by the startup alert."""
     stripe = f"{svc.config.stripe_mode} mode" if svc.stripe is not None else "not configured (payments are off)"
@@ -102,9 +127,11 @@ async def report_text(svc: Services, now: datetime, health: Mapping[str, JobHeal
         *health_lines(health, tz),
         "",
     ]
+    lines += await state_lines(svc, now)
     sync = await sync_line(svc, now)
     if sync is not None:
         lines.append(sync)
+    lines.append(await backup_line(svc))
     lines += mode_lines(svc)
     return "\n".join(lines)
 

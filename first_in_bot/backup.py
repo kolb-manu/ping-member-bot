@@ -20,10 +20,14 @@ import re
 import sqlite3
 import tempfile
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from datetime import time as time_of_day
 from pathlib import Path
 
-from .db import Database
+from .daily import daily_due
+from .db import Database, kv_set
+from .services import Services
+from .timeutil import from_iso, to_iso
 
 log = logging.getLogger(__name__)
 
@@ -185,3 +189,36 @@ def prune_backups(backup_dir: str, keep: int) -> list[Path]:
         path.unlink(missing_ok=True)
         log.info("Deleted old backup %s", path)
     return old
+
+
+# --- The nightly job --------------------------------------------------------------
+
+BACKUP_AT = time_of_day(3, 30)          # local time, config.timezone
+BACKUP_DATE_KEY = "last_backup_date"    # local date of the last backup that worked
+BACKUP_FAILED_KEY = "last_backup_failed_at"
+# The job ticks every minute so it can catch up after downtime, but a backup that
+# keeps failing (disk full, folder gone) is only retried this often.
+RETRY_AFTER = timedelta(minutes=30)
+
+
+async def nightly_backup(svc: Services, now: datetime) -> Path | None:
+    """Scheduler job, every minute: once a day at BACKUP_AT local time (or as soon
+    after as the bot is running), back up and prune to BACKUP_KEEP. Raises if the
+    backup fails, so the scheduler logs it and alerts the owner. None when not due."""
+    due, today = daily_due(now, svc.config.timezone, BACKUP_AT, await svc.db.kv_get(BACKUP_DATE_KEY))
+    if not due:
+        return None
+    failed_at = from_iso(await svc.db.kv_get(BACKUP_FAILED_KEY))
+    if failed_at is not None and timedelta(0) <= now - failed_at < RETRY_AFTER:
+        return None
+    try:
+        path = await backup_database(svc.db, svc.config.backup_dir, date.fromisoformat(today))
+    except BackupError:
+        async with svc.db.tx() as conn:
+            await kv_set(conn, BACKUP_FAILED_KEY, to_iso(now))
+        raise
+    async with svc.db.tx() as conn:
+        await kv_set(conn, BACKUP_DATE_KEY, today)
+        await conn.execute("DELETE FROM kv WHERE key=?", (BACKUP_FAILED_KEY,))
+    await asyncio.to_thread(prune_backups, svc.config.backup_dir, svc.config.backup_keep)
+    return path

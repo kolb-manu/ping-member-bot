@@ -3,14 +3,16 @@ before (re)starting the service, and the owner can run it by hand at any time.
 
 It does what startup does (config, database migrations, the token, the paid-channel
 rights, the Stripe price) and prints a PASS / WARN / FAIL list instead of starting.
-It never polls Telegram and never takes the single-instance lock, so it is safe to
-run while the bot is up. After a git pull, though, go through setup.sh, which stops
-the bot first, so new migrations aren't applied under the old code still running.
+It never polls Telegram, so it is safe to run while the bot is up. It holds the
+single-instance lock (lock.py) while it runs, so the bot can't start half way through.
+If the bot already holds it, the database check is skipped: opening the database
+runs migrations, and after a git pull those mustn't run under the old code. setup.sh
+stops the bot first, so it always gets the full check.
 
-It can't tell whether another copy of the bot is running. The only probe would be a
-getUpdates call, and Telegram settles a clash by ending the OLDER long poll in
-favour of the newer call, so a probe would cut off a running bot rather than detect
-it. DEPLOY.md tells the owner to stop the Mac copy first instead.
+It can only see a copy running on this machine. A copy elsewhere (the Mac) could
+only be probed with getUpdates, and Telegram settles a clash by ending the OLDER
+long poll in favour of the newer call, so a probe would cut off a running bot
+rather than detect it. DEPLOY.md tells the owner to stop the Mac copy first instead.
 
 Each check takes its gateways as arguments, so the tests run them against fakes.
 Secrets are never printed, and error text from the APIs is scrubbed of anything
@@ -38,10 +40,10 @@ from dotenv import find_dotenv, load_dotenv
 
 from .config import Config, ConfigError, load_config
 from .db import MIGRATIONS, Database
+from .lock import AlreadyRunning, InstanceLock, acquire_instance_lock, lock_path_for
 from .stripe_gateway import StripeGateway
 from .telegram_gateway import TelegramGateway
 
-DEFAULT_BACKUP_DIR = "backups"
 # Bot tokens (also inside .../bot<token>/getMe URLs) and Stripe keys.
 _SECRET_RE = re.compile(r"\d{5,}:[A-Za-z0-9_-]{30,}|\b(?:sk|rk|pk)_(?:test|live)_\S+")
 _MAX_DETAIL = 200
@@ -98,6 +100,20 @@ def check_env_file(path: str) -> Check:
     if _others_can_read(path):
         return Check(Status.WARN, ".env", f"other users on this machine can read {path}: run chmod 600 .env")
     return Check(Status.PASS, ".env", f"{path} (only you can read it)")
+
+
+def check_not_running(db_path: str) -> tuple[Check, InstanceLock | None]:
+    """The lock, if no copy of the bot holds it here; the caller releases it."""
+    try:
+        lock = acquire_instance_lock(lock_path_for(db_path))
+    except AlreadyRunning as exc:
+        return Check(Status.WARN, "Running copy",
+                     f"{scrub(str(exc))} The database check is skipped so new migrations don't run under "
+                     "it (setup.sh stops the service first)."), None
+    except OSError as exc:
+        return Check(Status.FAIL, "Running copy", f"couldn't create the lock file: {_describe(exc)}"), None
+    return Check(Status.PASS, "Running copy", "no other copy is running on this machine (one on your Mac "
+                                              "can't be seen from here)"), lock
 
 
 async def check_database(db_path: str) -> Check:
@@ -188,11 +204,18 @@ def check_backup_dir(path: str) -> Check:
 
 async def run_checks(config: Config, bot: BotIdentity, tg: ChannelRights,
                      stripe_gw: PriceReader | None, backup_dir: str) -> list[Check]:
-    checks = [await check_database(config.db_path)]
-    checks += await check_telegram(bot, tg, config)
-    checks.append(await check_stripe(config, stripe_gw))
-    checks.append(check_removals(config))
-    checks.append(check_backup_dir(backup_dir))
+    running, lock = check_not_running(config.db_path)
+    checks = [running]
+    try:
+        if lock is not None:
+            checks.append(await check_database(config.db_path))
+        checks += await check_telegram(bot, tg, config)
+        checks.append(await check_stripe(config, stripe_gw))
+        checks.append(check_removals(config))
+        checks.append(check_backup_dir(backup_dir))
+    finally:
+        if lock is not None:
+            lock.release()
     return checks
 
 
@@ -202,8 +225,7 @@ async def preflight(config: Config, *, session: BaseSession | None = None,
     bot = Bot(config.bot_token, session=session)
     tg = TelegramGateway(bot, config.paid_channel_id)
     stripe_gw = StripeGateway(config.stripe_api_key, client=stripe_client) if config.stripe_api_key else None
-    # backup_dir is a newer config field; fall back to the default folder without it.
-    backup_dir = getattr(config, "backup_dir", DEFAULT_BACKUP_DIR)
+    backup_dir = config.backup_dir
     try:
         return await run_checks(config, bot, tg, stripe_gw, backup_dir)
     finally:

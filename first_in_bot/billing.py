@@ -7,6 +7,7 @@ comes only from is_entitled, which treats sub_status trialing/active as entitled
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import logging
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ MISSING_STATUS = "missing"
 # More than one checkout-poll pass, less than the 5-minute sync interval.
 SYNC_RACE_MARGIN = timedelta(seconds=120)
 ALERT_LIST_LIMIT = 20
+DUPLICATE_REMINDER = timedelta(hours=24)
 
 
 @dataclass(frozen=True)
@@ -472,15 +474,17 @@ async def sync_subscriptions(svc: Services, now: datetime) -> SyncResult:
     log.info("Stripe sync: %d subscriptions, %d users updated, %d left for next sync, %d unmatched, ok=%s",
              result.subscriptions, result.users_updated, result.skipped, result.unmatched, result.ok)
     # One alert per kind for the whole sync, after it: alert_owner never raises, so a
-    # failed DM can't fail the sync. It's rate-limited, so duplicates nobody has sorted
-    # out yet are a reminder every 30 minutes, not every sync.
+    # failed DM can't fail the sync. Duplicates are keyed by exactly who and which
+    # subscriptions, so a new one is alerted at once, while ones nobody has sorted
+    # out yet are a daily reminder rather than one every 30 minutes.
     if duplicates:
-        await alert_owner(svc, "multiple_subs", "\n".join([
+        key = hashlib.sha256("\n".join(duplicates).encode()).hexdigest()[:12]
+        await alert_owner(svc, f"multiple_subs:{key}", "\n".join([
             "⚠️ <b>More than one live subscription</b>",
             _alert_list(duplicates),
             "Access comes from the best one. Cancel the extra one in the Stripe dashboard so they "
-            "aren't charged twice. Until then this reminder comes every 30 minutes.",
-        ]), now)
+            "aren't charged twice. Until then this reminder comes once a day.",
+        ]), now, interval=DUPLICATE_REMINDER)
     if missing:
         await alert_owner(svc, "sub_missing", "\n".join([
             "⚠️ <b>Subscription no longer at Stripe</b>",

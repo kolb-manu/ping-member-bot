@@ -26,6 +26,7 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping
 import aiosqlite
 
 from .alerts import alert_owner, send_owner, short_error
+from .backup import nightly_backup
 from .billing import poll_checkouts, sync_subscriptions
 from .db import Database, kv_set
 from .disputes import check_disputes
@@ -73,8 +74,10 @@ def build_jobs(svc: Services) -> list[Job]:
     jobs += [
         Job("send_notices", 300, lambda: send_notices(svc, svc.now()), initial_delay=30),
         Job("sweep_removals", 600, lambda: sweep_removals(svc, svc.now()), initial_delay=90),
-        # Checks every minute; it only sends once a day, at 09:00 local time.
+        # These two check every minute but do their work once a day: the report at
+        # 09:00 local time, the backup at 03:30 (or as soon after as the bot is up).
         Job("daily_report", 60, lambda: daily_report_job(svc, svc.now(), health), initial_delay=60),
+        Job("backup", 60, lambda: nightly_backup(svc, svc.now()), initial_delay=45),
     ]
     return jobs
 

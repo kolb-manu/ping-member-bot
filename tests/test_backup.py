@@ -226,3 +226,76 @@ def test_prune_refuses_to_keep_nothing(tmp_path):
     with pytest.raises(ValueError):
         prune_backups(str(tmp_path), keep=0)
     assert (tmp_path / backup_name(DAY)).exists()
+
+
+# --- the nightly job ---------------------------------------------------------------
+
+from first_in_bot.backup import BACKUP_DATE_KEY, BACKUP_FAILED_KEY, RETRY_AFTER, nightly_backup  # noqa: E402
+from tests.fakes import NOW, FakeTelegram, make_svc  # noqa: E402
+
+NIGHT = datetime(2026, 11, 2, 3, 30, tzinfo=timezone.utc)   # 03:30 GMT = 03:30 London in November
+
+
+def _svc(db, folder, **overrides):
+    return make_svc(db, FakeTelegram(), None, BACKUP_DIR=str(folder), **overrides)
+
+
+async def test_nightly_backup_runs_once_a_day_at_half_three(db, tmp_path):
+    svc = _svc(db, tmp_path / "b")
+    await add_user(db, 1)
+    assert await nightly_backup(svc, NIGHT - timedelta(minutes=1)) is None
+    path = await nightly_backup(svc, NIGHT)
+    assert path == tmp_path / "b" / "first-in-2026-11-02.db"
+    assert await db.kv_get(BACKUP_DATE_KEY) == "2026-11-02"
+    # Done for today: later ticks (and restarts) don't repeat it.
+    assert await nightly_backup(svc, NIGHT + timedelta(hours=5)) is None
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
+    conn.close()
+
+
+async def test_nightly_backup_catches_up_after_downtime(db, tmp_path):
+    # Down at 03:30: the first tick after that, the same day, does it.
+    svc = _svc(db, tmp_path / "b")
+    assert await nightly_backup(svc, NOW) == tmp_path / "b" / "first-in-2026-11-01.db"
+
+
+async def test_nightly_backup_uses_the_local_date_in_summer(db, tmp_path):
+    # 23:45 UTC on 24 Oct is 00:45 London (BST), so not yet due on the 25th...
+    svc = _svc(db, tmp_path / "b")
+    assert await nightly_backup(svc, datetime(2026, 10, 24, 23, 45, tzinfo=timezone.utc)) is None
+    # ...and 02:30 UTC on the 25th (after the clocks went back) is 02:30 GMT: still not 03:30.
+    assert await nightly_backup(svc, datetime(2026, 10, 25, 2, 30, tzinfo=timezone.utc)) is None
+    path = await nightly_backup(svc, datetime(2026, 10, 25, 3, 30, tzinfo=timezone.utc))
+    assert path.name == "first-in-2026-10-25.db"
+
+
+async def test_nightly_backup_prunes_to_backup_keep(db, tmp_path):
+    folder = tmp_path / "b"
+    folder.mkdir()
+    for day in ("2026-10-28", "2026-10-29", "2026-10-30"):
+        (folder / f"first-in-{day}.db").write_bytes(b"old")
+    (folder / "before-deploy.db").write_bytes(b"keep me")
+    svc = _svc(db, folder, BACKUP_KEEP="2")
+    await nightly_backup(svc, NIGHT)
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "before-deploy.db", "first-in-2026-10-30.db", "first-in-2026-11-02.db"]
+
+
+async def test_failed_backup_raises_and_is_retried_every_half_hour(db, tmp_path):
+    blocker = tmp_path / "not-a-folder"
+    blocker.write_text("x")
+    svc = _svc(db, blocker)
+    with pytest.raises(BackupError):
+        await nightly_backup(svc, NIGHT)
+    assert await db.kv_get(BACKUP_DATE_KEY) is None
+    assert await db.kv_get(BACKUP_FAILED_KEY) is not None
+    # The job ticks every minute, but a failing backup isn't hammered.
+    assert await nightly_backup(svc, NIGHT + timedelta(minutes=1)) is None
+    with pytest.raises(BackupError):
+        await nightly_backup(svc, NIGHT + RETRY_AFTER)
+    # Once it works again the failure mark goes.
+    blocker.unlink()
+    good = _svc(db, blocker)
+    assert await nightly_backup(good, NIGHT + 2 * RETRY_AFTER) is not None
+    assert await db.kv_get(BACKUP_FAILED_KEY) is None

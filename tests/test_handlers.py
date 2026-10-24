@@ -321,7 +321,7 @@ async def test_help_for_everyone_else_is_unchanged(svc):
         assert msg.answers == [(texts.HELP, None)]
 
 
-ADMIN_COMMANDS = ["/stats", "/user", "/grant", "/revoke", "/ban", "/unban", "/dryrun", "/confirmsweep",
+ADMIN_COMMANDS = ["/stats", "/report", "/user", "/grant", "/revoke", "/ban", "/unban", "/dryrun", "/confirmsweep",
                   "/pause", "/resume"]
 
 
@@ -343,6 +343,7 @@ async def test_admin_commands_ignored_for_non_admins(svc, tg):
     stranger = 999
     for handler, args in [
         (admin_handlers.cmd_stats, ()),
+        (admin_handlers.cmd_report, ()),
         (admin_handlers.cmd_user, (cmd("user", "5"),)),
         (admin_handlers.cmd_grant, (cmd("grant", "5 30"),)),
         (admin_handlers.cmd_dryrun, ()),
