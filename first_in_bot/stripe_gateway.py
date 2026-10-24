@@ -23,6 +23,12 @@ import stripe
 log = logging.getLogger(__name__)
 
 STRIPE_API_VERSION = "2026-09-30.endive"
+# Every call runs in a worker thread that a shutdown can't cancel, and the process
+# only exits once that thread is done. stripe-python's default of 80 s a request
+# would outlast systemd's 45 s stop timeout, so: 12 s a request and 2 retries, about
+# 38 s at worst with Stripe's pauses between tries (and well under a second normally).
+STRIPE_TIMEOUT = 12.0
+STRIPE_RETRIES = 2
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
 _KEY_RE = re.compile(r"\b(sk|rk|pk)_(test|live)_\S+")
 _CURRENCY_SYMBOLS = {"gbp": "£", "eur": "€", "usd": "$"}
@@ -44,6 +50,10 @@ class CustomerMissing(StripeGatewayError):
 
 class SubscriptionMissing(StripeGatewayError):
     """The subscription no longer exists at Stripe."""
+
+
+class CheckoutMissing(StripeGatewayError):
+    """Stripe has no such checkout session (e.g. test data was deleted)."""
 
 
 def _resource_missing(exc: BaseException | None, param: str | None = None) -> bool:
@@ -192,7 +202,10 @@ class StripeGateway:
     def __init__(self, api_key: str, *, client: Any | None = None):
         # client is for tests; normally we build the real one here.
         self._client = client or stripe.StripeClient(
-            api_key, stripe_version=STRIPE_API_VERSION, max_network_retries=3
+            api_key,
+            stripe_version=STRIPE_API_VERSION,
+            max_network_retries=STRIPE_RETRIES,
+            http_client=stripe.RequestsClient(timeout=STRIPE_TIMEOUT),
         )
 
     async def _call(self, name: str, fn: Callable[[], T]) -> T:
@@ -261,10 +274,16 @@ class StripeGateway:
         return parse_checkout(session)
 
     async def get_checkout(self, session_id: str) -> CheckoutInfo:
-        session = await self._call(
-            "checkout.sessions.retrieve",
-            lambda: self._client.v1.checkout.sessions.retrieve(session_id, {"expand": ["subscription"]}),
-        )
+        """Raises CheckoutMissing if Stripe has no such session."""
+        try:
+            session = await self._call(
+                "checkout.sessions.retrieve",
+                lambda: self._client.v1.checkout.sessions.retrieve(session_id, {"expand": ["subscription"]}),
+            )
+        except StripeGatewayError as exc:
+            if _resource_missing(exc.__cause__):
+                raise CheckoutMissing(f"Stripe has no checkout session {session_id}") from exc.__cause__
+            raise
         return parse_checkout(session)
 
     async def list_subscriptions(self) -> list[SubInfo]:

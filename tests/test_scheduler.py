@@ -4,18 +4,16 @@ import asyncio
 import json
 from dataclasses import replace
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
 
-from first_in_bot import main
 from first_in_bot.billing import SyncResult
-from first_in_bot.db import Database
+from first_in_bot.daily import SKIPPED
 from first_in_bot.scheduler import Job, JobHealth, JobHealthStore, Scheduler, build_jobs
 from first_in_bot.telegram_gateway import SendResult
 from first_in_bot.timeutil import to_iso
 from first_in_bot.users import get_user, register_user
-from tests.fakes import NOW, OWNER, FakeTelegram, add_user, make_config, make_svc
+from tests.fakes import NOW, OWNER, FakeTelegram, add_user, make_svc
 
 M = timedelta(minutes=1)
 
@@ -98,16 +96,20 @@ async def test_job_list_depends_on_stripe(db, stripe_fake):
     no_stripe = [j.name for j in build_jobs(make_svc(db, FakeTelegram(), None))]
     assert no_stripe == ["send_notices", "sweep_removals", "daily_report", "backup"]
     jobs = {j.name: j for j in build_jobs(make_svc(db, FakeTelegram(), stripe_fake))}
-    assert set(jobs) == {"sync_subscriptions", "poll_checkouts", "check_disputes", "send_notices",
-                         "sweep_removals", "daily_report", "backup"}
+    assert set(jobs) == {"sync_subscriptions", "poll_checkouts", "check_disputes", "refresh_price",
+                         "send_notices", "sweep_removals", "daily_report", "backup"}
     assert jobs["check_disputes"].interval == 86400
+    # A failed dispute check is tried again in half an hour, not a day later.
+    assert jobs["check_disputes"].retry_interval == 1800
+    assert {name for name, j in jobs.items() if j.retry_interval is not None} == {"check_disputes"}
+    assert jobs["refresh_price"].interval == 300
     assert jobs["poll_checkouts"].interval == 30 and jobs["sweep_removals"].interval == 600
     assert jobs["sync_subscriptions"].initial_delay < jobs["sweep_removals"].initial_delay
     assert jobs["daily_report"].interval == 60 and jobs["daily_report"].initial_delay == 60
     assert jobs["backup"].interval == 60
     # Stripe blips are normal: only a run of three failures alerts. Everything else alerts at once.
     assert {name: j.alert_after for name, j in jobs.items() if j.alert_after != 1} == {
-        "sync_subscriptions": 3, "poll_checkouts": 3}
+        "sync_subscriptions": 3, "poll_checkouts": 3, "check_disputes": 3, "refresh_price": 3}
 
 
 async def test_daily_report_job_is_wired_to_the_report(db, tg, stripe_fake, clock):
@@ -347,62 +349,121 @@ async def test_cancelling_run_still_stops_every_loop():
     assert all(task.done() for task in scheduler._tasks.values())
 
 
-async def test_main_shuts_down_in_order_and_alerts_on_startup(monkeypatch):
-    """Polling stops (aiogram does that on SIGTERM), then the job that's mid-run
-    finishes, then the bot session closes, then the DB."""
-    events = []
-    started = asyncio.Event()
-    tg = FakeTelegram()
+# --- ticks with nothing to do, and retrying sooner after a failure ------------------------------
 
-    async def mid_run_job():
-        started.set()
-        await asyncio.sleep(0.05)               # still going when polling stops
-        events.append("job finished")
+async def test_skipped_ticks_count_as_neither_success_nor_failure(csvc, tg, clock):
+    job = Job("j", 60, outcomes(RuntimeError("a"), SKIPPED, SKIPPED, RuntimeError("b"), SKIPPED, None))
+    scheduler = Scheduler([job], svc=csvc)
+    store = JobHealthStore(csvc.db)
+    assert await scheduler.run_once(job) is False
+    clock.advance(M)
+    assert [await scheduler.run_once(job) for _ in range(2)] == [True, True]   # not failures...
+    h = await store.get("j")
+    assert (h.consecutive_failures, h.last_ok_at) == (1, None)                 # ...and not successes
+    assert tg.sent_to(OWNER) == ["⚠️ <b>Job j failed once</b>\nLast error: RuntimeError: a\n"
+                                 "It keeps retrying on its own, and I'll tell you when it works again."]
+    clock.advance(M)
+    await scheduler.run_once(job)
+    await scheduler.run_once(job)
+    assert (await store.get("j")).consecutive_failures == 2                    # each real try counts
+    await scheduler.run_once(job)
+    assert tg.sent_to(OWNER)[-1] == "✅ j is working again."
+    assert (await store.get("j")).last_ok_at == NOW + 2 * M
 
-    class FakeSession:
-        async def close(self):
-            events.append("session closed")
 
-    class FakeBot:
-        def __init__(self, token, default=None):
-            self.session = FakeSession()
+async def test_a_failed_run_is_retried_after_retry_interval():
+    job = Job("daily", 86400, outcomes(RuntimeError("blip"), SyncResult(ok=False), None, SKIPPED),
+              retry_interval=1800)
+    sleeps = []
 
-        async def get_me(self):
-            return SimpleNamespace(id=42, username="FirstInTestBot")
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) > 4:
+            raise asyncio.CancelledError   # ends the only loop, so run() returns
+        await asyncio.sleep(0)
 
-    class FakeDispatcher:
-        async def start_polling(self, bot, **kwargs):
-            events.append(("polling", kwargs["close_bot_session"]))
-            await started.wait()
-            events.append("polling stopped")
+    await Scheduler([job], sleep=fake_sleep).run()
+    # Raised, not ok: half an hour. Worked, nothing to do: back to the usual day.
+    assert sleeps == [0, 1800, 1800, 86400, 86400]
 
-    class FakeDatabase:
-        @staticmethod
-        async def open(path):
-            db = await Database.open(":memory:")
-            close = db.close
 
-            async def closing():
-                events.append("db closed")
-                await close()
+# --- the real jobs through the scheduler --------------------------------------------------------
 
-            db.close = closing
-            return db
+NIGHT = NOW.replace(day=2, hour=3, minute=30)   # 03:30 GMT is 03:30 London in November
 
-    async def rights_problems(bot_id):
-        return ["the bot is not an admin of the paid channel"]
 
-    tg.bot_rights_problems = rights_problems
-    monkeypatch.setattr(main, "Bot", FakeBot)
-    monkeypatch.setattr(main, "Database", FakeDatabase)
-    monkeypatch.setattr(main, "TelegramGateway", lambda bot, channel_id: tg)
-    monkeypatch.setattr(main, "build_dispatcher", lambda svc: FakeDispatcher())
-    monkeypatch.setattr(main, "build_jobs", lambda svc: [Job("mid_run", 3600, mid_run_job)])
+async def test_failing_backup_alerts_per_real_try_and_never_falsely_recovers(db, tg, clock, tmp_path):
+    """The backup ticks every minute but only tries every RETRY_AFTER while it keeps
+    failing. The ticks in between mustn't count as it working again."""
+    blocker = tmp_path / "not-a-folder"
+    blocker.write_text("x")   # so the backup folder can't be made: disk full, folder gone
+    svc = replace(make_svc(db, tg, None, BACKUP_DIR=str(blocker / "backups")), clock=clock)
+    [job] = [j for j in build_jobs(svc) if j.name == "backup"]
+    scheduler = Scheduler([job], svc=svc)
+    store = JobHealthStore(db)
 
-    await asyncio.wait_for(main.run(make_config(STRIPE_API_KEY="", STRIPE_PRICE_ID="")), 5)
-    # aiogram must not close the session itself: the job may still be sending DMs.
-    assert events == [("polling", False), "polling stopped", "job finished", "session closed", "db closed"]
+    clock.now = NIGHT
+    for _ in range(30):   # 03:30 to 03:59: one real try, then waiting to retry
+        await scheduler.run_once(job)
+        clock.advance(M)
     [alert] = tg.sent_to(OWNER)
-    assert "🟢 <b>First In member bot started</b>" in alert
-    assert "Stripe: not configured" in alert and "Removals: dry run" in alert
-    assert "the bot is not an admin of the paid channel" in alert
+    assert "Job backup failed once" in alert and "BackupError" in alert
+    h = await store.get("backup")
+    assert (h.consecutive_failures, h.failures_since_report, h.last_ok_at) == (1, 1, None)
+
+    await scheduler.run_once(job)   # 04:00: the next real try fails too, and the count goes up
+    assert (await store.get("backup")).consecutive_failures == 2
+    assert "Job backup failed 2 times in a row" in tg.sent_to(OWNER)[-1]
+
+    blocker.unlink()                # fixed, but nothing is due until 04:30
+    for _ in range(30):
+        clock.advance(M)
+        await scheduler.run_once(job)
+    assert clock.now == NIGHT + 60 * M
+    assert [m for m in tg.sent_to(OWNER) if "working again" in m] == ["✅ backup is working again."]
+    assert len(tg.sent_to(OWNER)) == 3
+    h = await store.get("backup")
+    assert (h.consecutive_failures, h.failures_since_report, h.last_ok_at) == (0, 2, NIGHT + 60 * M)
+    assert (blocker / "backups" / "first-in-2026-11-02.db").exists()
+
+
+async def test_failing_daily_report_is_not_working_again_at_midnight(csvc, tg, clock, monkeypatch):
+    from first_in_bot import report
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("report broke")
+
+    monkeypatch.setattr(report, "report_text", broken)
+    [job] = [j for j in build_jobs(csvc) if j.name == "daily_report"]
+    scheduler = Scheduler([job], svc=csvc)
+    clock.now = NOW.replace(day=2, hour=9)
+    await scheduler.run_once(job)
+    assert "Job daily_report failed once" in tg.sent_to(OWNER)[0]
+    clock.now = NOW.replace(day=3, hour=0)   # a new day, not due until 09:00
+    await scheduler.run_once(job)
+    assert len(tg.sent_to(OWNER)) == 1 and (await JobHealthStore(csvc.db).get("daily_report")).last_ok_at is None
+
+    monkeypatch.undo()
+    clock.now = NOW.replace(day=3, hour=9)
+    await scheduler.run_once(job)
+    assert "First In daily report" in tg.sent_to(OWNER)[1]
+    assert tg.sent_to(OWNER)[2] == "✅ daily_report is working again."
+
+
+async def test_checkout_poll_alerts_when_stripe_keeps_failing(csvc, tg, stripe_fake, clock):
+    from first_in_bot.billing import start_checkout
+
+    await start_checkout(csvc, await add_user(csvc.db, 1), NOW)
+    stripe_fake.fail_get = True
+    [job] = [j for j in build_jobs(csvc) if j.name == "poll_checkouts"]
+    scheduler = Scheduler([job], svc=csvc)
+    for _ in range(2):
+        await scheduler.run_once(job)
+        clock.advance(timedelta(seconds=30))
+    assert tg.sent_to(OWNER) == []                    # a blip or two is normal
+    await scheduler.run_once(job)
+    [alert] = tg.sent_to(OWNER)
+    assert "Job poll_checkouts failed 3 times in a row" in alert
+    stripe_fake.fail_get = False
+    await scheduler.run_once(job)
+    assert tg.sent_to(OWNER)[-1] == "✅ poll_checkouts is working again."

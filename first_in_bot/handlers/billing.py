@@ -39,6 +39,11 @@ router = Router(name="billing")
 router.message.filter(F.chat.type == "private")
 router.callback_query.filter(F.message.chat.type == "private")
 
+# Instead of a checkout link while the price couldn't be read from Stripe: the
+# price and interval must come before any Stripe link, and the bot reads it again
+# every few minutes (billing.refresh_price).
+PRICE_UNKNOWN = "Sorry, payments are briefly unavailable. Please try again in a few minutes."
+
 
 @dataclass(frozen=True)
 class Reply:
@@ -89,6 +94,8 @@ async def checkout_reply(svc: Services, telegram_id: int, now: datetime, wanted_
         return Reply(texts.PAYMENT_PROBLEM, manage_keyboard())
     if offer.kind == "disputed":
         return Reply(texts.DISPUTED_NO_CHECKOUT.format(contact=contact_line(svc)))
+    if offer.kind == "price_unknown":
+        return Reply(PRICE_UNKNOWN)
     assert offer.url is not None
     if offer.with_trial:
         assert offer.trial_end is not None

@@ -232,3 +232,34 @@ async def test_cancelled_while_paused_gets_no_reminder_after_resume(svc, tg):
         await conn.execute("UPDATE users SET cancel_at_period_end=1 WHERE telegram_id=1")
     await clear_paused(svc.db, NOW + H, by=OWNER)
     assert await send_notices(svc, NOW + H) == 0 and tg.events == []
+
+
+async def test_reminder_sent_under_its_old_name_is_not_sent_again(tmp_path, tg, stripe_fake):
+    """Before migration 6 the reminder was recorded as 'trial_2d'. A database from
+    then, with a trial still inside the new (wider) window, mustn't get it twice."""
+    import aiosqlite
+
+    from first_in_bot import db as db_module
+
+    end = NOW + timedelta(days=1, hours=12)
+    path = str(tmp_path / "old.db")
+    conn = await aiosqlite.connect(path, isolation_level=None)
+    for migration in db_module.MIGRATIONS[:5]:
+        await migration(conn)
+    await conn.execute("INSERT INTO kv VALUES('schema_version', '5')")
+    await conn.execute(
+        "INSERT INTO users(telegram_id, created_at, stripe_sub_id, sub_status, sub_trial_end) "
+        "VALUES(5, ?, 'sub_5', 'trialing', ?), (6, ?, 'sub_6', 'trialing', ?)",
+        (to_iso(NOW), to_iso(end), to_iso(NOW), to_iso(end)),
+    )
+    await conn.execute("INSERT INTO notices_sent VALUES(5, 'trial_2d', ?, ?)", (to_iso(end), to_iso(NOW - H)))
+    await conn.close()
+
+    upgraded = await db_module.Database.open(path)
+    try:
+        svc = make_svc(upgraded, tg, stripe_fake)
+        assert await send_notices(svc, NOW) == 1          # only user 6, who never had it
+        assert tg.sent_to(5) == [] and len(tg.sent_to(6)) == 1
+        assert (5, "trial_reminder", to_iso(end)) in await notice_rows(upgraded)
+    finally:
+        await upgraded.close()

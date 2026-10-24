@@ -8,6 +8,9 @@ import pytest
 import stripe
 
 from first_in_bot.stripe_gateway import (
+    STRIPE_RETRIES,
+    STRIPE_TIMEOUT,
+    CheckoutMissing,
     CustomerMissing,
     PortalNotConfigured,
     StripeGateway,
@@ -299,3 +302,30 @@ async def test_get_subscription_missing_vs_other_errors():
     with pytest.raises(StripeGatewayError) as exc:
         await gw.get_subscription("sub_tc")
     assert not isinstance(exc.value, SubscriptionMissing)
+
+
+async def test_get_checkout_missing_vs_other_errors():
+    client = fake_client()
+    gw = StripeGateway("rk_test_x", client=client)
+    client.v1.checkout.sessions.retrieve.error = no_such("session", "checkout.session: 'cs_gone'")
+    with pytest.raises(CheckoutMissing):
+        await gw.get_checkout("cs_gone")
+    client.v1.checkout.sessions.retrieve.error = stripe.APIConnectionError("network down")
+    with pytest.raises(StripeGatewayError) as exc:
+        await gw.get_checkout("cs_1")
+    assert not isinstance(exc.value, CheckoutMissing)
+
+
+def test_real_client_has_a_bounded_timeout_and_keeps_the_api_version():
+    """A Stripe call runs in a thread that shutdown can't cancel, so one call with
+    all its retries must fit inside systemd's 45 s stop timeout."""
+    gw = StripeGateway("rk_test_" + "x" * 20)
+    requestor = gw._client._requestor
+    http = requestor._client
+    assert isinstance(http, stripe.RequestsClient) and http._timeout == STRIPE_TIMEOUT
+    assert requestor._options.max_network_retries == STRIPE_RETRIES
+    assert requestor._options.stripe_version == "2026-09-30.endive"
+    # Every try timing out, plus stripe-python's pauses between tries (0.5 s, doubling).
+    pauses = sum(min(stripe.HTTPClient.INITIAL_DELAY * 2 ** n, stripe.HTTPClient.MAX_DELAY)
+                 for n in range(STRIPE_RETRIES))
+    assert (STRIPE_RETRIES + 1) * STRIPE_TIMEOUT + pauses < 40

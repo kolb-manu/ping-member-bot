@@ -1,4 +1,7 @@
-"""/start, the welcome screen and "How it works"."""
+"""/start, the welcome screen and "How it works".
+
+The price comes from svc.price_label when each message is made, not from a value
+fixed at startup, so a price read later (billing.refresh_price) shows at once."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -9,11 +12,12 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from .. import texts
 from ..config import Config
-from ..db import Database
 from ..keyboards import CB_HOW, checkout_button
 from ..models import User
-from ..timeutil import format_local_date, utcnow
+from ..services import Services
+from ..timeutil import format_local_date
 from ..users import get_user, register_user, trial_eligible
+from .billing import _answer
 
 router = Router(name="start")
 router.message.filter(F.chat.type == "private")
@@ -46,20 +50,18 @@ def start_reply(
 
 
 @router.message(CommandStart())
-async def on_start(
-    message: Message, command: CommandObject, db: Database, config: Config, price_label: str | None = None
-) -> None:
+async def on_start(message: Message, command: CommandObject, svc: Services) -> None:
     if message.from_user is None:
         return
     user, _ = await register_user(
-        db,
+        svc.db,
         telegram_id=message.from_user.id,
         username=message.from_user.username,
         first_name=message.from_user.first_name,
         payload=command.args,
-        now=utcnow(),
+        now=svc.now(),
     )
-    text, markup = start_reply(user, config, price_label)
+    text, markup = start_reply(user, svc.config, svc.price_label)
     await message.answer(text, reply_markup=markup)
 
 
@@ -75,8 +77,14 @@ def how_it_works_text(user: User | None, price_label: str | None, config: Config
 
 
 @router.callback_query(F.data == CB_HOW)
-async def on_how(callback: CallbackQuery, db: Database, config: Config, price_label: str | None = None) -> None:
-    await callback.answer()
+async def on_how(callback: CallbackQuery, svc: Services) -> None:
+    # A press from before a restart can be too old to answer; that mustn't stop the reply.
+    await _answer(callback)
+    user = await get_user(svc.db, callback.from_user.id)
+    text = how_it_works_text(user, svc.price_label, svc.config, svc.now())
     if isinstance(callback.message, Message):
-        user = await get_user(db, callback.from_user.id)
-        await callback.message.answer(how_it_works_text(user, price_label, config, utcnow()))
+        await callback.message.answer(text)
+    else:
+        # The welcome is too old or was deleted (an InaccessibleMessage), so write
+        # to the user directly. In a private chat that's the same chat.
+        await svc.tg.send(callback.from_user.id, text)
