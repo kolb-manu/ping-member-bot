@@ -17,7 +17,7 @@ from first_in_bot.stripe_gateway import StripeGatewayError, parse_subscription
 from first_in_bot.telegram_gateway import SendResult
 from first_in_bot.timeutil import from_iso, to_iso
 from first_in_bot.users import get_user
-from tests.fakes import NOW, FakeStripe, add_user, audit_actions, sub_info, trial_sub
+from tests.fakes import NOW, OWNER, FakeStripe, add_user, audit_actions, sub_info, trial_sub
 from tests.test_stripe_gateway import sub_payload
 
 M = timedelta(minutes=1)
@@ -502,3 +502,49 @@ async def test_open_trial_session_without_a_stored_trial_end_is_not_reused(svc, 
     offer = await start_checkout(svc, await get_user(svc.db, 1), NOW + 20 * M)
     assert not offer.reused and offer.trial_end == NOW + 20 * M + timedelta(days=14)
     assert len(stripe_fake.created) == 2
+
+
+# --- owner alerts from the sync -------------------------------------------------------------
+
+async def test_multiple_live_subscriptions_alert_the_owner_rate_limited(svc, stripe_fake, tg):
+    await add_user(svc.db, 1)
+    await add_user(svc.db, 2)
+    stripe_fake.subscriptions = [
+        sub_info(id="sub_a", status="active"), sub_info(id="sub_b", status="trialing", created=NOW + M),
+        sub_info(id="sub_c", status="active", telegram_id=2, customer="cus_2"),
+        sub_info(id="sub_d", status="past_due", telegram_id=2, customer="cus_2"),
+    ]
+    await sync_subscriptions(svc, NOW)
+    [alert] = tg.sent_to(OWNER)
+    assert "More than one live subscription" in alert
+    assert "user 1: sub_a, sub_b\nuser 2: sub_c, sub_d" in alert       # one DM for everyone
+    await sync_subscriptions(svc, NOW + 5 * M)
+    assert len(tg.sent_to(OWNER)) == 1
+    await sync_subscriptions(svc, NOW + 30 * M)
+    assert len(tg.sent_to(OWNER)) == 2                                  # a reminder while it lasts
+
+
+async def test_subscription_gone_from_stripe_alerts_once(svc, stripe_fake, tg):
+    await add_user(svc.db, 1)
+    await apply_subscription(svc.db, sub_info(id="sub_gone", status="trialing"), NOW - timedelta(days=1))
+    await sync_subscriptions(svc, NOW)
+    [alert] = tg.sent_to(OWNER)
+    assert "Subscription no longer at Stripe" in alert and "user 1: sub_gone" in alert
+    await sync_subscriptions(svc, NOW + 31 * M)
+    assert len(tg.sent_to(OWNER)) == 1                                  # marked once, so alerted once
+
+
+async def test_a_failing_alert_never_fails_the_sync(svc, stripe_fake, tg, monkeypatch):
+    async def exploding_send(*args, **kwargs):
+        raise RuntimeError("Telegram is down")
+
+    monkeypatch.setattr(tg, "send", exploding_send)
+    await add_user(svc.db, 1)
+    await add_user(svc.db, 2)
+    await apply_subscription(svc.db, sub_info(id="sub_gone", telegram_id=2, customer="cus_2"),
+                             NOW - timedelta(days=1))
+    stripe_fake.subscriptions = [sub_info(id="sub_a"), sub_info(id="sub_b", created=NOW + M)]
+    result = await sync_subscriptions(svc, NOW)
+    assert result.ok and result.multiple == [1]
+    assert await svc.db.kv_get(LAST_FULL_SYNC_KEY) == to_iso(NOW)
+    assert (await get_user(svc.db, 2)).sub_status == billing.MISSING_STATUS
