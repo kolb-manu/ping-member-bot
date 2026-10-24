@@ -10,6 +10,20 @@ entitled mid-sweep is left alone. With REMOVALS_ENABLED=false (the default, and
 how it stays for now) it's a dry run: nobody is removed and only the owner gets a
 "Would remove" report, and only when that report changes (a report that couldn't
 be delivered is retried next sweep).
+
+While paused (/pause, see maintenance.py) the scheduled sweep doesn't run at all:
+no Telegram lookups, no audit rows, no report fingerprints, no owner DM. Leaving
+the fingerprints as they were means that after /resume the owner only hears
+about what changed, and the pause and resume are themselves in the audit log. A
+pause that lands mid-sweep is caught by the re-check before each DM and kick.
+
+When the mass-removal cap blocks a sweep, the owner's report invites
+/confirmsweep, and once that report has been delivered the exact set of people
+it listed is stored (CONFIRM_KEY). confirm_sweep re-runs the whole evaluation
+with only the cap lifted, and goes ahead only within an hour and only if
+everyone it would now remove was in that set; anything else is refused with the
+new report. An approval is used once, and a sweep that is no longer blocked
+drops it.
 """
 from __future__ import annotations
 
@@ -24,8 +38,9 @@ from . import texts
 from .access import set_in_channel
 from .audit import audit, audit_if_changed
 from .billing import LAST_FULL_SYNC_KEY
-from .db import kv_set
+from .db import Database, kv_set
 from .keyboards import ended_keyboard
+from .maintenance import paused_since
 from .models import User
 from .notices import NoticeOutcome, deliver_notice
 from .services import Services
@@ -42,6 +57,12 @@ FINGERPRINT_KEY = "sweep_report_fingerprint"
 NOTIFIED_KEY = "sweep_report_notified_fp"
 REPORT_LIST_LIMIT = 40
 REPORT_MAX_CHARS = 4000   # Telegram's message limit is 4096 (UTF-16 units)
+# The cap-blocked set the owner was shown, and when, for /confirmsweep.
+CONFIRM_KEY = "sweep_confirm_pending"
+CONFIRM_TTL = timedelta(hours=1)
+CONFIRM_PROMPT = "Reply /confirmsweep within an hour to go ahead with exactly these removals."
+PAUSED_LINE = "⏸ Paused: nobody is removed and no reminders go out until /resume."
+NOT_BLOCKED_NOTE = "The cap isn't holding this back any more, so the regular sweep handles it on its next run."
 
 SKIP_LABELS = {
     "admin": "admin",
@@ -51,6 +72,7 @@ SKIP_LABELS = {
     "stale_sync": "Stripe sync is stale",
     "dm_failed": "DM failed, retrying next sweep",
     "now_entitled": "became entitled during the sweep",
+    "paused": "paused, held until /resume",
 }
 ENDED_LABELS = {"trial_ended": "trial ended", "sub_ended": "subscription ended", "access_ended": "free access ended"}
 ENDED_TEXTS = {"trial_ended": texts.TRIAL_ENDED, "sub_ended": texts.SUB_ENDED, "access_ended": texts.ACCESS_ENDED}
@@ -66,6 +88,24 @@ class SweepReport:
     removed: list[int] = field(default_factory=list)
     failed: list[int] = field(default_factory=list)
     owner_notified: bool = False
+    paused: bool = False       # /pause is on (the scheduled sweep then does nothing)
+    cap_lifted: bool = False   # a run approved with /confirmsweep
+
+
+@dataclass(frozen=True)
+class PendingConfirm:
+    """A cap-blocked set the owner was shown and may approve with /confirmsweep."""
+    ids: frozenset[int]
+    at: datetime   # when the owner was shown it; the approval lasts CONFIRM_TTL
+    raw: str       # the stored value, so using it is a compare-and-delete
+
+
+@dataclass(frozen=True)
+class ConfirmResult:
+    """The /confirmsweep reply. offer: a new cap-blocked report shown in the reply, to
+    be stored as the next approval only once the reply has reached the owner."""
+    text: str
+    offer: SweepReport | None = None
 
 
 def ended_kind(user: User, was_active: bool = False) -> str:
@@ -126,27 +166,58 @@ def _listing(items: list[str]) -> str:
     return shown + (f" … and {extra} more" if extra > 0 else "")
 
 
-def format_report(report: SweepReport) -> str:
+def _removals(report: SweepReport) -> list[str]:
+    return [f"{_label(u)} ({ENDED_LABELS[ended_kind(u)]})" for u in report.would_remove]
+
+
+def _skipped_line(report: SweepReport) -> str:
+    skipped = [f"{_label(u)} ({SKIP_LABELS[reason]})" for u, reason in report.skipped]
+    return f"Skipped ({len(skipped)}): {_listing(skipped)}"
+
+
+def format_report(report: SweepReport, *, offer_confirm: bool = False) -> str:
+    """The owner's report. offer_confirm: a cap-blocked report the owner may approve,
+    so it ends with the /confirmsweep line, which survives even if the list is cut."""
     mode = "dry run, nobody removed" if report.dry_run else "removals on"
-    lines = [f"🧹 <b>Removal sweep</b> ({mode})", f"Entitled members in channel: {report.entitled_in_channel}"]
-    remove = [f"{_label(u)} ({ENDED_LABELS[ended_kind(u)]})" for u in report.would_remove]
+    if report.cap_lifted:
+        mode += ", cap lifted by /confirmsweep"
+    lines = [f"🧹 <b>Removal sweep</b> ({mode})"]
+    if report.paused:
+        lines.append(PAUSED_LINE)
+    lines.append(f"Entitled members in channel: {report.entitled_in_channel}")
+    remove = _removals(report)
     lines.append(f"Would remove ({len(remove)}): {_listing(remove) if remove else 'nobody'}")
     if report.blocked:
         lines.append(f"⛔ Blocked by the mass-removal cap: {html.escape(report.blocked)}. "
                      "Nobody will be removed; removals are held.")
     if report.skipped:
-        skipped = [f"{_label(u)} ({SKIP_LABELS[reason]})" for u, reason in report.skipped]
-        lines.append(f"Skipped ({len(skipped)}): {_listing(skipped)}")
+        lines.append(_skipped_line(report))
     if report.removed:
         lines.append(f"Removed ({len(report.removed)}): {_listing([str(i) for i in report.removed])}")
     if report.failed:
         lines.append(f"Removal failed ({len(report.failed)}): {_listing([str(i) for i in report.failed])}")
+    if not offer_confirm:
+        return _fit("\n".join(lines))
+    return _fit("\n".join(lines), REPORT_MAX_CHARS - _utf16_len(CONFIRM_PROMPT) - 1) + "\n" + CONFIRM_PROMPT
+
+
+def format_confirm_dry_run(report: SweepReport) -> str:
+    """/confirmsweep with REMOVALS_ENABLED=false: the whole flow, minus the removals."""
+    remove = _removals(report)
+    lines = [f"🧹 Dry run: with the cap lifted I would remove {len(remove)}: {_listing(remove)}.",
+             "Nobody was removed because REMOVALS_ENABLED=false."]
+    if report.skipped:
+        lines.append(_skipped_line(report))
     return _fit("\n".join(lines))
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
 
 
 def _fit(text: str, limit: int = REPORT_MAX_CHARS) -> str:
     """Keep the report under Telegram's length limit, or it's rejected every time."""
-    if len(text.encode("utf-16-le")) // 2 <= limit:
+    if _utf16_len(text) <= limit:
         return text
     suffix = "\n… (cut short)"
     budget = limit - len(suffix)
@@ -203,12 +274,15 @@ async def _record(svc: Services, report: SweepReport, now: datetime, notify_owne
     if not notify_owner or (notified is None and nothing_to_say) or svc.owner_id is None:
         await _set_notified(svc, fp)   # nothing the owner needs to hear about this state
         return
-    result = await svc.tg.send(svc.owner_id, format_report(report))
+    result = await svc.tg.send(svc.owner_id, format_report(report, offer_confirm=report.blocked is not None))
     if result is SendResult.FAILED:
         log.warning("Couldn't DM the sweep report to the owner; retrying next sweep")
         return
     if result is SendResult.OK:
         report.owner_notified = True
+        if report.blocked:
+            # Only now: an approval must always match a report the owner actually got.
+            await offer_confirm(svc, report, now)
     else:
         # BLOCKED (owner hasn't pressed /start) or REJECTED: retrying won't help. /dryrun still works.
         log.warning("The owner didn't get the sweep report (%s)", result.value)
@@ -217,11 +291,14 @@ async def _record(svc: Services, report: SweepReport, now: datetime, notify_owne
 
 async def _recheck(svc: Services, user: User, report: SweepReport, now: datetime) -> User | None:
     """Re-read the user just before acting: a sync, a checkout poll, the I've-paid
-    button or /grant may have changed them during the sweep's network calls.
-    Returns the fresh row, or None (skip, recorded) if they mustn't be removed."""
+    button or /grant may have changed them during the sweep's network calls, and
+    /pause may have been switched on. Returns the fresh row, or None (skip,
+    recorded) if they mustn't be removed."""
     fresh = await get_user(svc.db, user.telegram_id)
     reason = None
-    if fresh is None or not fresh.in_paid_channel:
+    if await paused_since(svc.db) is not None:
+        reason = "paused"
+    elif fresh is None or not fresh.in_paid_channel:
         reason = "not_in_channel"
     elif svc.entitled(fresh, now):
         reason = "now_entitled"
@@ -281,13 +358,16 @@ async def _remove(svc: Services, user: User, report: SweepReport, now: datetime)
 async def remove_one(svc: Services, user: User, now: datetime) -> str:
     """Admin /revoke and /ban: take one person out of the channel through the same
     checks as the sweep (not an admin, Telegram confirms they're in, not entitled,
-    Stripe data fresh), but only when removals are switched on. Returns a sentence
-    for the admin saying what happened."""
+    Stripe data fresh), but only when removals are switched on and not paused.
+    Returns a sentence for the admin saying what happened."""
     if not svc.config.removals_enabled:
         return ("REMOVALS_ENABLED is false, so I did not remove them from the channel. "
                 "/dryrun shows who the sweep would remove.")
     if svc.entitled(user, now):
         return "They still have access another way (trial, subscription or grant), so I did not remove them."
+    if await paused_since(svc.db) is not None:
+        # Their flag is already set, so the sweep takes them out after /resume.
+        return "Paused, so I didn't remove them; the sweep will once you /resume."
     last_sync = from_iso(await svc.db.kv_get(LAST_FULL_SYNC_KEY))
     # A banned user is not entitled whatever Stripe says, so a stale sync doesn't matter.
     sync_fresh = user.banned or (last_sync is not None and now - last_sync < SYNC_MAX_AGE)
@@ -308,12 +388,11 @@ async def remove_one(svc: Services, user: User, now: datetime) -> str:
     return f"Not removed: {SKIP_LABELS.get(skipped, skipped)}."
 
 
-async def sweep_removals(svc: Services, now: datetime, *, force_dry_run: bool = False) -> SweepReport:
-    """Scheduler job, and /dryrun with force_dry_run=True (which only reports:
-    no owner DM, no fingerprint, no audit rows)."""
-    dry_run = force_dry_run or not svc.config.removals_enabled
+async def _evaluate(svc: Services, now: datetime, dry_run: bool) -> SweepReport:
+    """Who would be removed right now, why everyone else is skipped, and the cap
+    verdict. Asks Telegram about each candidate but changes nothing, apart from
+    clearing the in-channel flag of someone who turns out to have left."""
     report = SweepReport(dry_run=dry_run)
-
     candidates: list[User] = []
     for row in await svc.db.fetchall("SELECT * FROM users WHERE in_paid_channel=1 ORDER BY telegram_id"):
         user = User.from_row(row)
@@ -334,17 +413,37 @@ async def sweep_removals(svc: Services, now: datetime, *, force_dry_run: bool = 
 
     report.blocked = cap_problem(len(report.would_remove), report.entitled_in_channel,
                                  svc.config.max_removals_per_sweep)
-    if force_dry_run:
-        return report
+    return report
 
+
+async def _audit_skips(svc: Services, report: SweepReport, now: datetime) -> None:
     async with svc.db.tx() as conn:
         for user, reason in report.skipped:
             await audit_if_changed(conn, now, user.telegram_id, "sweep_skip", reason)
 
+
+async def sweep_removals(svc: Services, now: datetime, *, force_dry_run: bool = False) -> SweepReport:
+    """Scheduler job, and /dryrun with force_dry_run=True (which only reports:
+    no owner DM, no fingerprint, no audit rows). While paused the job does nothing
+    at all (see the module docstring); /dryrun still reports, with a paused line."""
+    dry_run = force_dry_run or not svc.config.removals_enabled
+    since = await paused_since(svc.db)
+    if since is not None and not force_dry_run:
+        log.info("Sweep: paused since %s, so not running", to_iso(since))
+        return SweepReport(dry_run=dry_run, paused=True)
+
+    report = await _evaluate(svc, now, dry_run)
+    report.paused = since is not None
+    if force_dry_run:
+        return report
+
+    await _audit_skips(svc, report, now)
+    if not report.blocked:
+        await _drop_confirm(svc, now, "sweep no longer blocked")
+
     if dry_run or report.blocked:
         if report.blocked:
             log.warning("Sweep blocked by the mass-removal cap: %s", report.blocked)
-        # TODO(phase 4): /confirmsweep to approve a sweep the cap blocked.
         await _record(svc, report, now, notify_owner=True)
         return report
 
@@ -352,3 +451,119 @@ async def sweep_removals(svc: Services, now: datetime, *, force_dry_run: bool = 
     for user in report.would_remove:
         await _remove(svc, user, report, now)
     return report
+
+
+# --- /confirmsweep ------------------------------------------------------------------
+
+def _ids_text(ids) -> str:
+    return " ".join(str(i) for i in sorted(ids))
+
+
+async def pending_confirm(db: Database) -> PendingConfirm | None:
+    raw = await db.kv_get(CONFIRM_KEY)
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+        at = from_iso(data["at"])
+        if at is None:
+            raise ValueError("no time")
+        return PendingConfirm(frozenset(int(i) for i in data["ids"]), at, raw)
+    except (ValueError, KeyError, TypeError):
+        # Nothing readable to approve, so /confirmsweep refuses as if nothing were pending.
+        log.error("The stored /confirmsweep approval can't be read; ignoring it")
+        return None
+
+
+async def offer_confirm(svc: Services, report: SweepReport, now: datetime) -> None:
+    """The owner has just been shown this cap-blocked report: from now they have
+    CONFIRM_TTL to approve exactly these people. Replaces any earlier offer."""
+    ids = sorted(u.telegram_id for u in report.would_remove)
+    async with svc.db.tx() as conn:
+        await kv_set(conn, CONFIRM_KEY, json.dumps({"ids": ids, "at": to_iso(now)}))
+        await audit(conn, now, None, "sweep_confirm", f"offered: {_ids_text(ids)}")
+
+
+async def _drop_confirm(svc: Services, now: datetime, why: str) -> None:
+    if await svc.db.kv_get(CONFIRM_KEY) is None:
+        return   # the usual case, and no write, so nothing churns every tick
+    async with svc.db.tx() as conn:
+        cur = await conn.execute("DELETE FROM kv WHERE key=?", (CONFIRM_KEY,))
+        if cur.rowcount:
+            await audit(conn, now, None, "sweep_confirm", f"dropped: {why}")
+
+
+async def _use_confirm(svc: Services, pending: PendingConfirm, now: datetime, detail: str) -> bool:
+    """Use the approval exactly once. False if a double tap or a newer report got
+    there first, in which case this /confirmsweep must do nothing."""
+    async with svc.db.tx() as conn:
+        cur = await conn.execute("DELETE FROM kv WHERE key=? AND value=?", (CONFIRM_KEY, pending.raw))
+        if cur.rowcount == 0:
+            return False
+        await audit(conn, now, None, "sweep_confirm", detail)
+    return True
+
+
+async def _audit_confirm(svc: Services, now: datetime, detail: str) -> None:
+    async with svc.db.tx() as conn:
+        await audit(conn, now, None, "sweep_confirm", detail)
+
+
+async def _refuse_with_report(svc: Services, report: SweepReport, now: datetime, why: str) -> ConfirmResult:
+    """Show the sweep as it stands so the owner can look again. If the cap still
+    blocks it, that report becomes the next approval once the reply reaches them."""
+    if report.blocked:
+        return ConfirmResult(f"{why}\n\n{format_report(report, offer_confirm=True)}", offer=report)
+    await _drop_confirm(svc, now, "sweep no longer blocked")
+    return ConfirmResult(f"{why}\n\n{format_report(report)}\n{NOT_BLOCKED_NOTE}")
+
+
+async def confirm_sweep(svc: Services, now: datetime, by: int) -> ConfirmResult:
+    """Admin /confirmsweep: run a sweep the mass-removal cap blocked, with the cap
+    lifted and every other check intact (not entitled, Telegram says they're in,
+    fresh Stripe sync, not an admin, re-checked before the DM and the kick).
+    Refuses while paused, when nothing is pending, when the approval is an hour
+    old, and when anyone outside the approved set would now be removed."""
+    if await paused_since(svc.db) is not None:
+        await _audit_confirm(svc, now, f"refused (paused) by={by}")
+        return ConfirmResult("Paused: /resume first. Nobody was removed.")
+    pending = await pending_confirm(svc.db)
+    if pending is None:
+        await _audit_confirm(svc, now, f"refused (nothing pending) by={by}")
+        return ConfirmResult("Nothing is waiting for /confirmsweep. It's only needed after a sweep report "
+                             "says the mass-removal cap held removals back.")
+
+    dry_run = not svc.config.removals_enabled
+    report = await _evaluate(svc, now, dry_run)
+    await _audit_skips(svc, report, now)
+    ids = frozenset(u.telegram_id for u in report.would_remove)
+
+    # A time in the future means the clock jumped; that's no approval to rely on either.
+    if not timedelta(0) <= now - pending.at < CONFIRM_TTL:
+        await _audit_confirm(svc, now, f"refused (expired, offered {to_iso(pending.at)}) by={by}")
+        return await _refuse_with_report(
+            svc, report, now, "That approval has expired (they last an hour), so nobody was removed. "
+                              "Here's the sweep as it stands now.")
+    new = ids - pending.ids
+    if new:
+        await _audit_confirm(svc, now, f"refused (not approved: {_ids_text(new)}) by={by}")
+        return await _refuse_with_report(
+            svc, report, now, f"Not going ahead: {len(new)} of the people it would now remove weren't in "
+                              "the report you were sent, so nobody was removed. Please look again.")
+    if not ids:
+        await _drop_confirm(svc, now, f"nobody left to remove at /confirmsweep by={by}")
+        return ConfirmResult("Nobody needs removing now (they renewed, left or are skipped below), so nobody "
+                             "was removed.\n\n" + format_report(report))
+
+    mode = " (dry run)" if dry_run else ""
+    if not await _use_confirm(svc, pending, now, f"approved{mode} by={by}: {_ids_text(ids)}"):
+        return ConfirmResult("That approval was just used or replaced, so I did nothing. "
+                             "Check the latest sweep report.")
+    report.blocked = None
+    report.cap_lifted = True
+    if dry_run:
+        return ConfirmResult(format_confirm_dry_run(report))
+    log.warning("Sweep cap lifted by /confirmsweep from %s for %d people", by, len(ids))
+    for user in report.would_remove:
+        await _remove(svc, user, report, now)
+    return ConfirmResult(format_report(report))

@@ -234,7 +234,11 @@ async def cmd_status(message: Message, svc: Services) -> None:
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, svc: Services) -> None:
-    await message.answer(texts.HELP)
+    text = texts.HELP
+    # Same check as handlers.admin.is_admin, kept here so only admins learn the commands exist.
+    if message.from_user is not None and message.from_user.id in svc.config.admin_ids:
+        text += "\n\n" + texts.HELP_ADMIN
+    await message.answer(text)
 
 
 @router.message(Command("terms"))
