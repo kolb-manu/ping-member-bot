@@ -1,15 +1,16 @@
 """Preflight checks, run with `python -m first_in_bot check`. setup.sh runs it
 before (re)starting the service, and the owner can run it by hand at any time.
 
-It does what startup does (config, database migrations, the token, the paid-channel
-rights, the Stripe price) and prints a PASS / WARN / FAIL list instead of starting.
-It never polls Telegram, so it is safe to run while the bot is up. It holds the
-single-instance lock (lock.py) while it runs, so the bot can't start half way through.
-If the bot already holds it, the database check is skipped: opening the database
-runs migrations, and after a git pull those mustn't run under the old code. setup.sh
-stops the bot first, so it always gets the full check.
+It checks what startup needs (config, the database, the token, the paid-channel
+rights, the Stripe price and what the Stripe key may read) and prints a
+PASS / WARN / FAIL list instead of starting. It changes nothing, so it is safe to
+run while the bot is up: it never polls Telegram, it only reads from Stripe, and
+it opens the database read-only. In particular it never runs migrations; the bot
+does that when it starts. After a git pull, a check that FAILs must leave the
+database as the old code left it, so the old code can still be started on it.
 
-It can only see a copy running on this machine. A copy elsewhere (the Mac) could
+It can only see a copy running on this machine (it tries the single-instance
+lock, lock.py, and lets go straight away). A copy elsewhere (the Mac) could
 only be probed with getUpdates, and Telegram settles a clash by ending the OLDER
 long poll in favour of the newer call, so a probe would cut off a running bot
 rather than detect it. DEPLOY.md tells the owner to stop the Mac copy first instead.
@@ -31,17 +32,19 @@ import stat
 import sys
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Protocol
 
+import stripe
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import ClientDecodeError, TelegramAPIError, TelegramUnauthorizedError
 from dotenv import find_dotenv, load_dotenv
 
 from .config import Config, ConfigError, load_config
-from .db import MIGRATIONS, Database
-from .lock import AlreadyRunning, InstanceLock, acquire_instance_lock, lock_path_for
-from .stripe_gateway import StripeGateway
+from .db import MIGRATIONS
+from .lock import AlreadyRunning, acquire_instance_lock, lock_path_for
+from .stripe_gateway import STRIPE_API_VERSION, StripeGateway
 from .telegram_gateway import TelegramGateway
 
 # Bot tokens (also inside .../bot<token>/getMe URLs) and Stripe keys.
@@ -74,6 +77,32 @@ class PriceReader(Protocol):
     async def price_label(self, price_id: str) -> str | None: ...
 
 
+class StripeLister(Protocol):
+    """Lists at most one object of a kind; raises the stripe library's errors."""
+    async def list_one(self, resource: str, expand: tuple[str, ...] = ()) -> None: ...
+
+
+@dataclass(frozen=True)
+class StripeProbe:
+    resource: str               # as in client.v1.<resource>, e.g. "checkout.sessions"
+    expand: tuple[str, ...]
+    needs: str                  # what to give the restricted key if Stripe refuses
+    shows: str                  # for the messages
+
+
+# Read-only calls, one for each kind of object the bot's own calls use. A list only
+# proves read access; a write permission (creating a checkout or a customer) can't
+# be tested without creating something, so for those the names say "write" because
+# that is what the key needs, and write includes read.
+STRIPE_PROBES = (
+    StripeProbe("subscriptions", (), "Subscriptions read", "subscriptions"),
+    # The daily disputes check expands each dispute's charge to find the customer.
+    StripeProbe("disputes", ("data.charge",), "Disputes read and Charges read", "disputes with their charges"),
+    StripeProbe("checkout.sessions", (), "Checkout Sessions write", "checkout sessions"),
+    StripeProbe("customers", (), "Customers write", "customers"),
+)
+
+
 def scrub(text: str) -> str:
     return _SECRET_RE.sub("[hidden]", text)
 
@@ -102,36 +131,80 @@ def check_env_file(path: str) -> Check:
     return Check(Status.PASS, ".env", f"{path} (only you can read it)")
 
 
-def check_not_running(db_path: str) -> tuple[Check, InstanceLock | None]:
-    """The lock, if no copy of the bot holds it here; the caller releases it."""
+def check_not_running(db_path: str) -> Check:
+    """Only looks: the lock is let go straight away, because nothing here writes."""
     try:
-        lock = acquire_instance_lock(lock_path_for(db_path))
+        acquire_instance_lock(lock_path_for(db_path)).release()
     except AlreadyRunning as exc:
         return Check(Status.WARN, "Running copy",
-                     f"{scrub(str(exc))} The database check is skipped so new migrations don't run under "
-                     "it (setup.sh stops the service first)."), None
+                     f"{scrub(str(exc))} The check itself only reads, so it's safe next to it "
+                     "(setup.sh stops the service before starting the new one).")
     except OSError as exc:
-        return Check(Status.FAIL, "Running copy", f"couldn't create the lock file: {_describe(exc)}"), None
+        return Check(Status.FAIL, "Running copy", f"couldn't create the lock file: {_describe(exc)}")
     return Check(Status.PASS, "Running copy", "no other copy is running on this machine (one on your Mac "
-                                              "can't be seen from here)"), lock
+                                              "can't be seen from here)")
+
+
+def _read_database(path: str) -> tuple[int, int | None]:
+    """(schema version, number of users or None if there's no users table yet)."""
+    # mode=ro: SQLite itself refuses every write, and a missing file is an error
+    # rather than a new empty database.
+    conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        version = 0
+        if "kv" in tables:
+            row = conn.execute("SELECT value FROM kv WHERE key='schema_version'").fetchone()
+            version = int(row[0]) if row else 0
+        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] if "users" in tables else None
+    finally:
+        conn.close()
+    return version, users
+
+
+def _cant_create(path: str) -> str | None:
+    """Why the bot couldn't create a database at path, or None if it could."""
+    folder = os.path.dirname(path)
+    while not os.path.exists(folder):     # Database.open makes the missing folders
+        folder = os.path.dirname(folder)
+    if not os.path.isdir(folder):
+        return f"{folder} is not a folder"
+    if not os.access(folder, os.W_OK | os.X_OK):
+        return f"can't write to {folder}"
+    return None
 
 
 async def check_database(db_path: str) -> Check:
-    """Opening runs any new migrations, exactly as startup would."""
-    where = db_path if db_path == ":memory:" else os.path.abspath(db_path)
-    existed = db_path == ":memory:" or os.path.exists(db_path)
+    """Read-only, and never migrates: the bot runs the migrations when it starts.
+    So a FAIL further down leaves the database as the code before a git pull left
+    it, and that code can still be started on it."""
+    if db_path == ":memory:":
+        return Check(Status.PASS, "Database", "in memory, so nothing is kept when the bot stops")
+    where = os.path.abspath(db_path)
+    if not os.path.exists(where):
+        problem = _cant_create(where)
+        if problem:
+            return Check(Status.FAIL, "Database", f"there's no database at {where} and the bot can't "
+                                                  f"create one: {problem}")
+        return Check(Status.PASS, "Database", f"none yet: a new database will be created at {where} "
+                                              "when the bot starts")
     try:
-        db = await Database.open(db_path)
-    except (OSError, sqlite3.Error, RuntimeError) as exc:
-        # RuntimeError: the schema is newer than this code (e.g. after a rollback).
-        return Check(Status.FAIL, "Database", f"couldn't open {where}: {_describe(exc)}")
-    try:
-        version = await db.kv_get("schema_version")
-        row = await db.fetchone("SELECT COUNT(*) AS n FROM users")
-    finally:
-        await db.close()
-    state = f"{_plural(row['n'], 'user')} in" if existed else "new, empty database created at"
-    return Check(Status.PASS, "Database", f"{state} {where} (schema version {version} of {len(MIGRATIONS)})")
+        version, users = await asyncio.to_thread(_read_database, where)
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return Check(Status.FAIL, "Database", f"couldn't read {where}: {_describe(exc)}")
+    latest = len(MIGRATIONS)
+    if version > latest:
+        # The bot would refuse to start (db.run_migrations).
+        return Check(Status.FAIL, "Database",
+                     f"the schema of {where} (version {version}) is newer than this code ({latest}). "
+                     "That happens after rolling back past a migration: restore the before-deploy copy "
+                     "from the newer version's deploy (DEPLOY.md, Roll back), or go back to the newer code")
+    state = f"{_plural(users, 'user')} in {where}" if users is not None else f"an empty database at {where}"
+    pending = latest - version
+    if pending:
+        return Check(Status.PASS, "Database", f"{state} (schema version {version} of {latest}: "
+                                              f"{_plural(pending, 'migration')} will run when the bot starts)")
+    return Check(Status.PASS, "Database", f"{state} (schema version {version} of {latest})")
 
 
 async def check_telegram(bot: BotIdentity, tg: ChannelRights, config: Config) -> list[Check]:
@@ -173,6 +246,30 @@ async def check_stripe(config: Config, stripe_gw: PriceReader | None) -> Check:
     return Check(Status.PASS, "Stripe", f"TEST mode, {config.stripe_price_id} is {label}")
 
 
+async def check_stripe_permissions(lister: StripeLister) -> list[Check]:
+    """A FAIL for each permission the restricted key lacks. Only lists, so nothing
+    is ever created; on a network error it stops after one WARN."""
+    checks = []
+    for probe in STRIPE_PROBES:
+        try:
+            await lister.list_one(probe.resource, probe.expand)
+        except stripe.PermissionError:
+            checks.append(Check(Status.FAIL, "Stripe key",
+                                f"the key may not read {probe.shows}: give it {probe.needs} (Stripe "
+                                "dashboard > Developers > API keys, edit the restricted key)"))
+        except stripe.StripeError as exc:
+            # Mostly the network; Stripe's own errors (rate limit, 500) land here too.
+            checks.append(Check(Status.WARN, "Stripe key",
+                                f"couldn't check what the key may read: {_describe(exc)}"))
+            return checks
+    if not checks:
+        checks.append(Check(Status.PASS, "Stripe key",
+                            "it may read subscriptions, disputes with their charges, checkout sessions "
+                            "and customers (whether it may also create them can't be checked without "
+                            "creating one)"))
+    return checks
+
+
 def check_removals(config: Config) -> Check:
     if config.removals_enabled:
         return Check(Status.WARN, "Removals",
@@ -202,20 +299,34 @@ def check_backup_dir(path: str) -> Check:
 
 # --- Wiring ---------------------------------------------------------------------
 
-async def run_checks(config: Config, bot: BotIdentity, tg: ChannelRights,
-                     stripe_gw: PriceReader | None, backup_dir: str) -> list[Check]:
-    running, lock = check_not_running(config.db_path)
-    checks = [running]
-    try:
-        if lock is not None:
-            checks.append(await check_database(config.db_path))
-        checks += await check_telegram(bot, tg, config)
-        checks.append(await check_stripe(config, stripe_gw))
-        checks.append(check_removals(config))
-        checks.append(check_backup_dir(backup_dir))
-    finally:
-        if lock is not None:
-            lock.release()
+class ClientLister:
+    """The real StripeLister, on a stripe.StripeClient (client.v1.<resource>.list)."""
+
+    def __init__(self, client: Any):
+        self._client = client
+
+    async def list_one(self, resource: str, expand: tuple[str, ...] = ()) -> None:
+        service = self._client.v1
+        for part in resource.split("."):
+            service = getattr(service, part)
+        params: dict[str, Any] = {"limit": 1}
+        if expand:
+            params["expand"] = list(expand)
+        # The library is synchronous, as in StripeGateway.
+        await asyncio.to_thread(service.list, params)
+
+
+async def run_checks(config: Config, bot: BotIdentity, tg: ChannelRights, stripe_gw: PriceReader | None,
+                     backup_dir: str, stripe_lister: StripeLister | None = None) -> list[Check]:
+    checks = [check_not_running(config.db_path), await check_database(config.db_path)]
+    checks += await check_telegram(bot, tg, config)
+    stripe_check = await check_stripe(config, stripe_gw)
+    checks.append(stripe_check)
+    # Only once the key and price are known to work, so one problem gives one FAIL.
+    if stripe_check.status is Status.PASS and stripe_lister is not None:
+        checks += await check_stripe_permissions(stripe_lister)
+    checks.append(check_removals(config))
+    checks.append(check_backup_dir(backup_dir))
     return checks
 
 
@@ -224,10 +335,16 @@ async def preflight(config: Config, *, session: BaseSession | None = None,
     """The real gateways, as main.run builds them. session and stripe_client are for tests."""
     bot = Bot(config.bot_token, session=session)
     tg = TelegramGateway(bot, config.paid_channel_id)
-    stripe_gw = StripeGateway(config.stripe_api_key, client=stripe_client) if config.stripe_api_key else None
+    stripe_gw = lister = None
+    if config.stripe_api_key:
+        # One client for the price and the permission probes, made as StripeGateway makes its own.
+        client = stripe_client or stripe.StripeClient(
+            config.stripe_api_key, stripe_version=STRIPE_API_VERSION, max_network_retries=3
+        )
+        stripe_gw, lister = StripeGateway(config.stripe_api_key, client=client), ClientLister(client)
     backup_dir = config.backup_dir
     try:
-        return await run_checks(config, bot, tg, stripe_gw, backup_dir)
+        return await run_checks(config, bot, tg, stripe_gw, backup_dir, lister)
     finally:
         await bot.session.close()
 

@@ -4,16 +4,19 @@ so main() is never called here)."""
 import dataclasses
 import os
 import runpy
+import sqlite3
 import sys
 from types import SimpleNamespace
 
 import pytest
+import stripe
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.methods import GetChatMember, GetMe
 from aiogram.types import User as TgUser
 
+from first_in_bot import db as db_module
 from first_in_bot import preflight, stripe_gateway
 from first_in_bot.db import MIGRATIONS, Database, kv_set
 from first_in_bot.preflight import Check, Status
@@ -91,15 +94,42 @@ class FakeSession(BaseSession):
         self.closed = True
 
 
-class FakeStripeClient:
-    """Just enough of stripe.StripeClient for StripeGateway.price_label."""
+def permission_error(resource: str) -> stripe.PermissionError:
+    # What Stripe sends a restricted key without the permission (HTTP 403).
+    return stripe.PermissionError(
+        f"The provided key '{STRIPE_KEY[:12]}***' does not have the required permissions for {resource}.",
+        http_status=403)
 
-    def __init__(self) -> None:
-        self.v1 = SimpleNamespace(prices=SimpleNamespace(retrieve=self._retrieve))
+
+class FakeStripeClient:
+    """Just enough of stripe.StripeClient for StripeGateway.price_label and the
+    permission probes. Only list() and prices.retrieve exist, so anything that
+    tried to create an object would fail. errors: resource -> what its list raises."""
+
+    def __init__(self, errors: dict[str, Exception] | None = None) -> None:
+        self.errors = errors or {}
+        self.listed: list[tuple[str, dict]] = []
+
+        def service(resource):
+            return SimpleNamespace(list=lambda params: self._list(resource, params))
+
+        self.v1 = SimpleNamespace(
+            prices=SimpleNamespace(retrieve=self._retrieve),
+            subscriptions=service("subscriptions"),
+            disputes=service("disputes"),
+            checkout=SimpleNamespace(sessions=service("checkout.sessions")),
+            customers=service("customers"),
+        )
 
     @staticmethod
     def _retrieve(price_id):
         return {"id": price_id, "unit_amount": 299, "currency": "gbp", "recurring": {"interval": "month"}}
+
+    def _list(self, resource, params):
+        self.listed.append((resource, params))
+        if resource in self.errors:
+            raise self.errors[resource]
+        return {"object": "list", "data": [], "has_more": False}
 
 
 @pytest.fixture(autouse=True)
@@ -165,19 +195,77 @@ def test_backup_dir_not_writable_fails(tmp_path):
 
 # --- Database --------------------------------------------------------------------
 
-async def test_database_created_then_reopened(tmp_path):
-    path = tmp_path / "data" / "first-in.db"
-    first = await preflight.check_database(str(path))
-    assert first.status is Status.PASS
-    assert "new, empty database created" in first.detail
-    assert f"schema version {len(MIGRATIONS)} of {len(MIGRATIONS)}" in first.detail
-    assert path.exists()
+def schema_version(path) -> str | None:
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute("SELECT value FROM kv WHERE key='schema_version'").fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
 
+
+async def make_old_database(path, monkeypatch, migrations: int, users: int = 1) -> None:
+    """A database as code with only the first `migrations` migrations left it."""
+    with monkeypatch.context() as m:
+        m.setattr(db_module, "MIGRATIONS", MIGRATIONS[:migrations])
+        db = await Database.open(str(path))
+        for telegram_id in range(1, users + 1):
+            await add_user(db, telegram_id)
+        await db.close()
+
+
+async def test_missing_database_passes_and_is_not_created(tmp_path):
+    path = tmp_path / "data" / "first-in.db"
+    check = await preflight.check_database(str(path))
+    assert check.status is Status.PASS
+    assert check.detail == f"none yet: a new database will be created at {path} when the bot starts"
+    assert not path.exists() and not path.parent.exists()
+
+
+async def test_current_database_shows_its_users(tmp_path):
+    path = tmp_path / "first-in.db"
     db = await Database.open(str(path))
     await add_user(db, 5)
     await db.close()
-    again = await preflight.check_database(str(path))
-    assert again.status is Status.PASS and f"1 user in {path}" in again.detail
+    check = await preflight.check_database(str(path))
+    assert check.status is Status.PASS
+    assert check.detail == f"1 user in {path} (schema version {len(MIGRATIONS)} of {len(MIGRATIONS)})"
+
+
+async def test_older_database_is_read_but_never_migrated(tmp_path, monkeypatch):
+    # The check runs after a git pull and before the new code starts. If it migrated,
+    # a FAIL further down would leave a database the old code refuses to open.
+    path = tmp_path / "first-in.db"
+    await make_old_database(path, monkeypatch, len(MIGRATIONS) - 1, users=2)
+    before = path.read_bytes()
+    check = await preflight.check_database(str(path))
+    assert check.status is Status.PASS
+    assert check.detail == (f"2 users in {path} (schema version {len(MIGRATIONS) - 1} of {len(MIGRATIONS)}: "
+                            "1 migration will run when the bot starts)")
+    assert schema_version(path) == str(len(MIGRATIONS) - 1)
+    assert path.read_bytes() == before
+
+
+async def test_failed_check_leaves_the_schema_alone(workdir, monkeypatch):
+    # From the review: on a schema-4 database a Telegram timeout FAILed the check,
+    # but the database step had already moved the schema on to 5.
+    path = workdir / "data" / "first-in.db"
+    path.parent.mkdir()
+    await make_old_database(path, monkeypatch, len(MIGRATIONS) - 1)
+    down = FakeBot(error=TelegramNetworkError(method=GetMe(), message="Request timeout error"))
+    config = make_config(STRIPE_API_KEY="", STRIPE_PRICE_ID="")
+    checks = await preflight.run_checks(config, down, FakeRights(), None, "backups")
+    assert ("Telegram", Status.FAIL) in statuses(checks)
+    assert schema_version(path) == str(len(MIGRATIONS) - 1)
+
+
+async def test_empty_file_counts_as_schema_0(tmp_path):
+    path = tmp_path / "first-in.db"
+    path.write_bytes(b"")
+    check = await preflight.check_database(str(path))
+    assert check.status is Status.PASS
+    assert f"an empty database at {path} (schema version 0 of {len(MIGRATIONS)}" in check.detail
+    assert path.read_bytes() == b""
 
 
 async def test_database_newer_than_code_fails(tmp_path):
@@ -189,13 +277,21 @@ async def test_database_newer_than_code_fails(tmp_path):
     await db.close()
     check = await preflight.check_database(path)
     assert check.status is Status.FAIL and "newer than this code" in check.detail
+    assert "restore the before-deploy copy" in check.detail
 
 
-async def test_database_that_cant_be_opened_fails(tmp_path):
+async def test_database_that_cant_be_created_fails(tmp_path):
     blocker = tmp_path / "data"
     blocker.write_text("")                    # a file where the data folder should be
     check = await preflight.check_database(str(blocker / "first-in.db"))
-    assert check.status is Status.FAIL and "couldn't open" in check.detail
+    assert check.status is Status.FAIL and f"{blocker} is not a folder" in check.detail
+
+
+async def test_file_that_isnt_a_database_fails(tmp_path):
+    path = tmp_path / "first-in.db"
+    path.write_text("not a database " * 100)
+    check = await preflight.check_database(str(path))
+    assert check.status is Status.FAIL and "couldn't read" in check.detail
 
 
 # --- Telegram --------------------------------------------------------------------
@@ -273,6 +369,62 @@ async def test_stripe_live_key_fails_and_is_never_shown():
     assert price.asked == []
 
 
+async def test_stripe_permissions_pass_with_read_only_one_object_calls():
+    client = FakeStripeClient()
+    [check] = await preflight.check_stripe_permissions(preflight.ClientLister(client))
+    assert check.status is Status.PASS and check.name == "Stripe key"
+    assert "can't be checked without creating one" in check.detail
+    assert client.listed == [
+        ("subscriptions", {"limit": 1}),
+        # The disputes check needs Charges read for this expand.
+        ("disputes", {"limit": 1, "expand": ["data.charge"]}),
+        ("checkout.sessions", {"limit": 1}),
+        ("customers", {"limit": 1}),
+    ]
+
+
+@pytest.mark.parametrize("resource, needs", [
+    ("subscriptions", "Subscriptions read"),
+    ("disputes", "Disputes read and Charges read"),
+    ("checkout.sessions", "Checkout Sessions write"),
+    ("customers", "Customers write"),
+])
+async def test_each_missing_stripe_permission_fails_by_name(resource, needs):
+    client = FakeStripeClient(errors={resource: permission_error(resource)})
+    checks = await preflight.check_stripe_permissions(preflight.ClientLister(client))
+    [check] = checks
+    assert check.status is Status.FAIL and f"give it {needs}" in check.detail
+    assert STRIPE_KEY[:12] not in check.detail
+    assert len(client.listed) == len(preflight.STRIPE_PROBES)     # the others still get checked
+
+
+async def test_several_missing_permissions_give_one_fail_each():
+    errors = {r: permission_error(r) for r in ("subscriptions", "customers")}
+    checks = await preflight.check_stripe_permissions(preflight.ClientLister(FakeStripeClient(errors)))
+    assert statuses(checks) == [("Stripe key", Status.FAIL)] * 2
+
+
+async def test_stripe_network_error_is_one_warning():
+    error = stripe.APIConnectionError(f"couldn't connect with {STRIPE_KEY}")
+    client = FakeStripeClient(errors={"subscriptions": error})
+    [check] = await preflight.check_stripe_permissions(preflight.ClientLister(client))
+    assert check.status is Status.WARN and "APIConnectionError" in check.detail
+    assert STRIPE_KEY not in check.detail
+    assert len(client.listed) == 1
+
+
+async def test_permissions_only_probed_once_the_price_check_passes(workdir):
+    client = FakeStripeClient()
+    lister = preflight.ClientLister(client)
+    checks = await preflight.run_checks(make_config(), FakeBot(), FakeRights(), FakePrice(label=None),
+                                        "backups", lister)
+    assert ("Stripe", Status.FAIL) in statuses(checks) and "Stripe key" not in [c.name for c in checks]
+    assert client.listed == []
+
+    checks = await preflight.run_checks(make_config(), FakeBot(), FakeRights(), FakePrice(), "backups", lister)
+    assert [c.name for c in checks][4:6] == ["Stripe", "Stripe key"]
+
+
 def test_removals_shown():
     assert preflight.check_removals(make_config()).status is Status.PASS
     assert "REMOVALS_ENABLED=false (dry run" in preflight.check_removals(make_config()).detail
@@ -295,17 +447,26 @@ async def test_run_checks_in_order(workdir):
     assert checks[0].status is Status.PASS
 
 
-async def test_run_checks_skips_the_database_while_the_bot_runs(workdir):
+async def test_run_checks_reads_the_database_while_the_bot_runs(workdir):
     from first_in_bot.lock import acquire_instance_lock, lock_path_for
 
     config = make_config()
+    path = workdir / "data" / "first-in.db"
     with acquire_instance_lock(lock_path_for(config.db_path)):
         checks = await preflight.run_checks(config, FakeBot(), FakeRights(), FakePrice(), "backups")
         assert checks[0].status is Status.WARN and "already running" in checks[0].detail
-        assert "Database" not in [c.name for c in checks]
-        assert not (workdir / "data" / "first-in.db").exists()   # no migrations under a running bot
-    # Released afterwards when it took the lock itself: the bot can start straight after.
-    checks = await preflight.run_checks(config, FakeBot(), FakeRights(), FakePrice(), "backups")
+        assert checks[1].name == "Database" and checks[1].status is Status.PASS   # read-only, so safe
+        assert not path.exists()
+
+        db = await Database.open(str(path))       # the running bot's own connection
+        try:
+            await add_user(db, 7)
+            checks = await preflight.run_checks(config, FakeBot(), FakeRights(), FakePrice(), "backups")
+        finally:
+            await db.close()
+        assert f"1 user in {path}" in checks[1].detail
+    # It never keeps the lock: the bot can start straight after.
+    await preflight.run_checks(config, FakeBot(), FakeRights(), FakePrice(), "backups")
     acquire_instance_lock(lock_path_for(config.db_path)).release()
 
 
@@ -335,19 +496,33 @@ async def test_full_run_passes_with_real_gateways_and_closes_the_session(workdir
     (workdir / "backups").chmod(0o700)
     env = {**GOOD, "STRIPE_API_KEY": STRIPE_KEY, "STRIPE_PRICE_ID": "price_123"}
     session = FakeSession()
-    code = await preflight.run(env, str(env_file), session=session, stripe_client=FakeStripeClient())
+    client = FakeStripeClient()
+    code = await preflight.run(env, str(env_file), session=session, stripe_client=client)
     out = capsys.readouterr().out
     assert code == 0, out
     assert "[FAIL]" not in out and "[WARN]" not in out
     assert "[PASS] Stripe: TEST mode, price_123 is £2.99/month" in out
+    assert "[PASS] Stripe key: it may read subscriptions" in out
     assert "[PASS] Removals: REMOVALS_ENABLED=false" in out
     assert "[PASS] Running copy: no other copy is running" in out
-    assert "9 passed, 0 warnings, 0 failed" in out
+    assert "[PASS] Database: none yet: a new database will be created" in out
+    assert "10 passed, 0 warnings, 0 failed" in out
     assert TOKEN not in out and TOKEN.split(":")[1] not in out and STRIPE_KEY not in out
     assert session.closed
     # Only lookups: never getUpdates, so a running copy isn't disturbed.
     assert {type(m) for m in session.requests} == {GetMe, GetChatMember}
-    assert (workdir / "data" / "first-in.db").exists()
+    assert len(client.listed) == len(preflight.STRIPE_PROBES)
+    assert not (workdir / "data" / "first-in.db").exists()     # created by the bot, not the check
+
+
+async def test_full_run_names_a_missing_stripe_permission(workdir, capsys):
+    env = {**GOOD, "STRIPE_API_KEY": STRIPE_KEY, "STRIPE_PRICE_ID": "price_123"}
+    client = FakeStripeClient(errors={"disputes": permission_error("disputes")})
+    code = await preflight.run(env, "", session=FakeSession(), stripe_client=client)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "[FAIL] Stripe key: the key may not read disputes with their charges: give it Disputes read " \
+           "and Charges read" in out
 
 
 async def test_failed_check_exits_1_and_still_closes_the_session(workdir, capsys):
