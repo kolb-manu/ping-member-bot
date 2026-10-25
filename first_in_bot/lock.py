@@ -5,12 +5,16 @@ It's an flock() on a file that stays open for the life of the process. The
 kernel drops the lock however the process ends, even kill -9 or a crash, so a
 stale lock can't happen and nobody ever has to delete the file by hand. The PID
 written into the file is only there for humans; the lock is what counts.
+
+A copy from before the lock existed (phase 2) doesn't take it, so the lock can't
+see one. unlocked_copies() looks for those in the process list instead.
 """
 from __future__ import annotations
 
 import fcntl
 import logging
 import os
+import subprocess
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
@@ -95,3 +99,47 @@ def _write_pid(fd: int) -> None:
     except OSError:
         # We hold the lock either way; a missing PID only makes the message vaguer.
         log.warning("Couldn't write the PID into the lock file", exc_info=True)
+
+
+# --- Copies that don't take the lock ------------------------------------------------
+
+def _process_table() -> list[tuple[int, str]]:
+    """(PID, command line) of every process on this machine, or nothing if ps
+    can't be run: this only adds to the lock, so it never stops the bot itself."""
+    try:
+        # -ww: never cut the command line short. -e and -o work on macOS and Linux.
+        out = subprocess.run(["ps", "-ww", "-eo", "pid=,args="], capture_output=True, text=True,
+                             timeout=10, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        log.warning("Couldn't list processes to look for an older copy of the bot", exc_info=True)
+        return []
+    table = []
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if pid.isdigit():
+            table.append((int(pid), args.strip()))
+    return table
+
+
+def is_bot_command(args: str) -> bool:
+    """`python -m first_in_bot` with nothing after it: the bot itself, not the
+    read-only `check`."""
+    words = args.split()
+    for i, word in enumerate(words[:-1]):
+        if word == "-m" and words[i + 1] == "first_in_bot":
+            return len(words) == i + 2
+    return False
+
+
+def unlocked_copies(own_pid: int) -> list[int]:
+    """PIDs of other copies of the bot running on this machine. Call it once the
+    lock is known to be free (or held by us): then any copy found is one that
+    doesn't take the lock, i.e. from before it existed."""
+    return sorted(pid for pid, args in _process_table() if pid != own_pid and is_bot_command(args))
+
+
+def unlocked_copy_text(pids: list[int]) -> str:
+    listed = ", ".join(str(pid) for pid in pids)
+    return (f"Another copy of the First In member bot is running without the lock file (PID {listed}), "
+            f"probably a version from before the lock existed. Only one copy can run at a time, "
+            f"so stop that one first (Ctrl+C in its terminal, or kill {listed}).")

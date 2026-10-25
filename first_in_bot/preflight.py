@@ -43,7 +43,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from .config import Config, ConfigError, load_config
 from .db import MIGRATIONS
-from .lock import AlreadyRunning, acquire_instance_lock, lock_path_for
+from .lock import AlreadyRunning, acquire_instance_lock, lock_path_for, unlocked_copies, unlocked_copy_text
 from .stripe_gateway import StripeGateway, make_client
 from .telegram_gateway import TelegramGateway
 
@@ -141,8 +141,12 @@ def check_not_running(db_path: str) -> Check:
                      "(setup.sh stops the service before starting the new one).")
     except OSError as exc:
         return Check(Status.FAIL, "Running copy", f"couldn't create the lock file: {_describe(exc)}")
-    return Check(Status.PASS, "Running copy", "no other copy is running on this machine (one on your Mac "
-                                              "can't be seen from here)")
+    others = unlocked_copies(os.getpid())
+    if others:
+        # Nothing stops it for you (setup.sh only stops the service), and the bot won't start next to it.
+        return Check(Status.FAIL, "Running copy", unlocked_copy_text(others))
+    return Check(Status.PASS, "Running copy", "no other copy is running on this machine (a copy on another "
+                                              "machine can't be seen from here)")
 
 
 def _read_database(path: str) -> tuple[int, int | None]:

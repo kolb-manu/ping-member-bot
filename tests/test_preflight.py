@@ -470,6 +470,19 @@ async def test_run_checks_reads_the_database_while_the_bot_runs(workdir):
     acquire_instance_lock(lock_path_for(config.db_path)).release()
 
 
+def test_a_copy_without_the_lock_fails_the_check(workdir, monkeypatch):
+    # The phase-2 bot never takes the lock, so only the process list shows it.
+    from first_in_bot import lock
+
+    monkeypatch.setattr(lock, "_process_table", lambda: [
+        (46429, ".venv/bin/python -m first_in_bot"),
+        (os.getpid(), ".venv/bin/python -m first_in_bot check"),
+    ])
+    check = preflight.check_not_running(make_config().db_path)
+    assert check.status is Status.FAIL
+    assert "without the lock file (PID 46429)" in check.detail and "kill 46429" in check.detail
+
+
 def test_report_counts_and_verdict(capsys):
     ok = [Check(Status.PASS, "A", "fine"), Check(Status.WARN, "B", "hmm")]
     assert preflight.print_report(ok) is True

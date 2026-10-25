@@ -6,7 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from first_in_bot.lock import AlreadyRunning, InstanceLock, acquire_instance_lock, lock_path_for
+from first_in_bot import lock as lock_module
+from first_in_bot.lock import (
+    AlreadyRunning,
+    InstanceLock,
+    _process_table,   # the real one: conftest swaps it for an empty table in every test
+    acquire_instance_lock,
+    is_bot_command,
+    lock_path_for,
+    unlocked_copies,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -133,3 +142,66 @@ def test_main_exits_when_another_copy_holds_the_lock(tmp_path, monkeypatch, caps
     assert exc.value.code == 3
     assert "already running" in capsys.readouterr().err
     assert not (tmp_path / "data" / "first-in.db").exists()
+
+
+# --- Copies from before the lock existed --------------------------------------------
+
+@pytest.mark.parametrize("args, is_bot", [
+    (".venv/bin/python -m first_in_bot", True),
+    ("/home/tom/first-in-member-bot/.venv/bin/python3 -u -m first_in_bot", True),
+    (".venv/bin/python -m first_in_bot check", False),        # the read-only preflight
+    (".venv/bin/python -m pytest tests/test_lock.py", False),
+    ("python -m first_in_bot_other", False),
+    ("vim first_in_bot/main.py", False),
+    ("", False),
+])
+def test_is_bot_command(args, is_bot):
+    assert is_bot_command(args) is is_bot
+
+
+def test_unlocked_copies_leaves_out_this_process_and_checks(monkeypatch):
+    monkeypatch.setattr(lock_module, "_process_table", lambda: [
+        (100, ".venv/bin/python -m first_in_bot"),
+        (200, ".venv/bin/python -m first_in_bot check"),
+        (300, ".venv/bin/python -m first_in_bot"),        # this process
+        (50, "/usr/bin/python3 -m first_in_bot"),
+    ])
+    assert unlocked_copies(own_pid=300) == [50, 100]
+
+
+def test_real_process_table_lists_this_process():
+    # The real ps, on macOS and Linux alike.
+    table = dict(_process_table())
+    assert os.getpid() in table
+    assert "python" in table[os.getpid()].lower() or "pytest" in table[os.getpid()].lower()
+
+
+def test_process_table_is_empty_when_ps_cant_run(monkeypatch, caplog):
+    def no_ps(*args, **kwargs):
+        raise FileNotFoundError("ps")
+    monkeypatch.setattr(lock_module.subprocess, "run", no_ps)
+    assert _process_table() == []
+    assert "Couldn't list processes" in caplog.text
+
+
+def test_main_exits_next_to_a_copy_without_the_lock(tmp_path, monkeypatch, capsys):
+    from first_in_bot import main as main_module
+    from tests.test_config import GOOD
+
+    db_path = str(tmp_path / "data" / "first-in.db")
+    monkeypatch.setattr(main_module, "load_dotenv", lambda: None)
+    monkeypatch.setattr(main_module.os, "environ", {**GOOD, "DB_PATH": db_path})
+    monkeypatch.setattr(lock_module, "_process_table", lambda: [(46429, ".venv/bin/python -m first_in_bot")])
+
+    def must_not_run(config):
+        raise AssertionError("the bot started next to an older copy")
+
+    monkeypatch.setattr(main_module, "run", must_not_run)
+    with pytest.raises(SystemExit) as exc:
+        main_module.main()
+    assert exc.value.code == 3
+    err = capsys.readouterr().err
+    assert "without the lock file (PID 46429)" in err and "kill 46429" in err
+    assert not (tmp_path / "data" / "first-in.db").exists()
+    # It let go of the lock on the way out, so the next start isn't blocked by it.
+    acquire_instance_lock(lock_path_for(db_path)).release()

@@ -15,7 +15,7 @@ It does not send ticket alerts (that's the separate `fixr-bot`). Full spec: `PIN
 - **Owner alerts** (a DM to the first `ADMIN_IDS`, at most one per kind of problem every 30 minutes, kept across restarts): the bot started (with Stripe mode, removals mode and channel-rights problems), a job failed (the Stripe sync and checkout polling only after 3 failures in a row), and a "working again" DM once it recovers. Also: a new payment dispute (once per dispute), duplicate live subscriptions (at once, then daily), a subscription that vanished from Stripe, and a mass-removal cap hit (in the sweep report).
 - **Daily report at 09:00 UK time**: the `/stats` numbers, "✅ All jobs healthy" or which jobs failed since the last report, how fresh the Stripe data is, the last backup, the pause, and a sweep waiting for `/confirmsweep`. `/report` shows it any time.
 - **Nightly backup at 03:30 UK time** with SQLite's online backup, to `backups/first-in-YYYY-MM-DD.db` (never overwriting: a second one that day is `-2`), keeping the newest 14 (`BACKUP_KEEP`). A failing backup is retried every 30 minutes and alerts the owner.
-- **One copy only**: a lock file next to the database (`data/first-in-member-bot.lock`). A second copy on the same machine exits straight away with "Another copy ... is already running" (exit code 3). A copy on another machine can't be seen, so stop the Mac copy before starting the VM one.
+- **One copy only**: a lock file next to the database (`data/first-in-member-bot.lock`). A second copy on the same machine exits straight away with "Another copy ... is already running" (exit code 3). A copy from before the lock existed (phase 2) doesn't take it, so the bot and the check also look at the process list and refuse to start next to one, naming its PID. A copy on another machine can't be seen, so stop the Mac copy before starting the VM one.
 - **Graceful stop** (Ctrl+C or systemd's SIGTERM): polling stops, a job or update mid-way gets up to 25 s to finish, then the bot session and the database close.
 - If the price can't be read from Stripe at startup, the bot retries, then checks every 5 minutes. Until it knows the price it won't send a Stripe link (the CLAUDE.md rule: price first), and the startup alert and daily report say so.
 - User commands: `/start`, `/subscribe`, `/manage`, `/status`, `/help`, `/terms`.
@@ -67,6 +67,12 @@ Everything else has a default. Only test-mode Stripe keys are accepted. `REMOVAL
 ## How to test (phase 3 checkpoint)
 
 Use a test bot, a test paid channel and a second Telegram account. Everything is Stripe **test mode**.
+
+Upgrading the phase-2 copy on the Mac: the first start runs database migrations 4 to 6, and the phase-2 code can't use the database after that. So first:
+
+- `chmod 600 .env`
+- `.venv/bin/python -m first_in_bot check`: "Running copy" FAILs with the old copy's PID while it still runs. That's expected.
+- Stop the old copy (Ctrl+C in its Terminal window, or `kill <PID>`), then keep a copy of the database: `sqlite3 data/first-in.db ".backup data/before-phase-3-4.db"`. To go back to phase 2: stop the bot, delete `data/first-in.db-wal` and `data/first-in.db-shm` if they're there, put that file back as `data/first-in.db`, and check out `main` (the phase-2 code).
 
 1. `.venv/bin/python -m pytest` passes. Then start the bot with `.venv/bin/python -m first_in_bot` and check the startup log: Stripe **TEST MODE**, no "Paid channel setup" warnings.
 2. Second account: open `t.me/<bot>?start=tt_test`. The welcome says the first 14 days are free, then the price, that a card is required, and that you can cancel before the first payment with `/manage`. **How it works** and `/terms` show the same facts plus the first-charge date. Nothing suggests a card isn't needed.

@@ -30,7 +30,7 @@ from .config import ConfigError, Config, load_config
 from .db import Database
 from .handlers import admin, billing, channel, start
 from .handlers.middleware import UnblockMiddleware
-from .lock import AlreadyRunning, acquire_instance_lock, lock_path_for
+from .lock import AlreadyRunning, acquire_instance_lock, lock_path_for, unlocked_copies, unlocked_copy_text
 from .report import mode_lines, state_lines
 from .scheduler import Scheduler, build_jobs
 from .services import Services
@@ -165,4 +165,10 @@ def main() -> None:
         print(exc, file=sys.stderr)
         sys.exit(3)
     with lock:
+        # An older copy that doesn't take the lock: it would poll Telegram too, and
+        # the DB would be migrated under it.
+        others = unlocked_copies(os.getpid())
+        if others:
+            print(unlocked_copy_text(others), file=sys.stderr)
+            sys.exit(3)
         asyncio.run(run(config))
