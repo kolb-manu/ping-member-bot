@@ -193,10 +193,10 @@ This is not legal advice.
 |---|---|
 | 2 | Free trial via Stripe Checkout (test mode), payment polling, full subscription sync, `/manage`, channel access, the trial reminders, dry-run removals, admin commands. Merged. |
 | 3 | Disputes check, test-clock script (nine scenarios: trial, first charge, renewal, failed payment and grace, cancellations, recovered payment), `/revoke` `/ban` `/unban`, pre-checkout trial terms, configurable reminders. Built on `trial-polish`, finished on branch `tom/phase-3-4`, waiting for the owner's checkpoint test. |
-| 4 | Owner alerts, job health, daily report, nightly backups, single-instance lock, graceful shutdown, `/pause` `/resume` `/confirmsweep` `/report`, preflight check, `setup.sh` and the `first-in-member-bot` systemd service, [DEPLOY.md](../DEPLOY.md). Built on branch `tom/phase-3-4` (715 tests) and reviewed; waiting for the owner's checkpoint test and the move to the VM, then a few days of dry-run removals. |
+| 4 | Owner alerts, job health, daily report, nightly backups, single-instance lock, graceful shutdown, `/pause` `/resume` `/confirmsweep` `/report`, preflight check, `setup.sh` and the `first-in-member-bot` systemd service, [DEPLOY.md](../DEPLOY.md). Built on branch `tom/phase-3-4` (727 tests), reviewed and smoke-tested on a copy of the real database; waiting for the owner's checkpoint test and the move to the VM, then a few days of dry-run removals. |
 | 5 | Go-live. The owner's decision only. |
 
-Also still to do: the alert bot change that posts to the new channels.
+The alert bot change that posts to the paid and free channels is built: v3 in `fix-alerts-bot` (merged to its `main` on 2026-10-19), off until `PAID_CHAT_ID` and `FREE_CHAT_ID` are set, with `PUBLIC_DRY_RUN=1` by default. Check that the VM runs v3 before the channels open.
 
 **Safety rules built into the plan**
 
