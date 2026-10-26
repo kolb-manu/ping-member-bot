@@ -1,5 +1,6 @@
 """Stripe billing: starting a checkout (with the free trial when eligible),
-detecting payment by polling (no webhooks in v1), and the full subscription sync.
+detecting payment by polling (no webhooks in v1), the full subscription sync, and
+reading the price that every message shows.
 
 The free trial is a Stripe subscription trial with a card required (owner
 decision 2026-10-18), so users.trial_ends_at is never set here. Access still
@@ -7,19 +8,32 @@ comes only from is_entitled, which treats sub_status trialing/active as entitled
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import html
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from . import texts
+from .alerts import alert_owner
 from .audit import audit, audit_if_changed
+from .daily import SKIPPED, Skipped
 from .db import Database, kv_set
-from .entitlement import ENTITLED_SUB_STATUSES
+from .entitlement import DISPUTED_STATUS, ENTITLED_SUB_STATUSES
 from .keyboards import join_channel_keyboard
 from .models import User
 from .notices import NoticeOutcome, deliver_notice
 from .services import Services
-from .stripe_gateway import CheckoutInfo, CustomerMissing, StripeGatewayError, SubInfo, SubscriptionMissing
+from .stripe_gateway import (
+    CheckoutInfo,
+    CheckoutMissing,
+    CustomerMissing,
+    StripeGateway,
+    StripeGatewayError,
+    SubInfo,
+    SubscriptionMissing,
+)
 from .timeutil import format_local, from_iso, to_iso
 from .users import get_user, trial_eligible
 
@@ -38,14 +52,22 @@ TERMINAL_STATUSES = frozenset({"canceled", "incomplete_expired"})
 MISSING_STATUS = "missing"
 # More than one checkout-poll pass, less than the 5-minute sync interval.
 SYNC_RACE_MARGIN = timedelta(seconds=120)
+ALERT_LIST_LIMIT = 20
+DUPLICATE_REMINDER = timedelta(hours=24)
+# Stripe statuses where the subscription is still there to fix (pay the open invoice
+# in the portal), so selling another one would only make a duplicate.
+FIX_PAYMENT_STATUSES = frozenset({"past_due", "unpaid"})
+# Reading the price at startup: the pause before each retry, in seconds.
+PRICE_RETRY_DELAYS = (2.0, 5.0)
 
 
 @dataclass(frozen=True)
 class CheckoutOffer:
-    kind: str                 # "checkout" | "already_in" | "fix_payment"
+    kind: str                 # "checkout" | "already_in" | "fix_payment" | "disputed" | "price_unknown"
     url: str | None = None
     with_trial: bool = False
     reused: bool = False
+    trial_end: datetime | None = None   # the fixed first-charge moment baked into the session
 
 
 @dataclass
@@ -54,6 +76,12 @@ class PollResult:
     completed: int = 0
     expired: int = 0
     errors: int = 0
+
+    @property
+    def ok(self) -> bool:
+        # A session Stripe couldn't be asked about may be a payment nobody has seen
+        # yet, so the scheduler counts the run as failed and alerts if it keeps up.
+        return self.errors == 0
 
 
 @dataclass
@@ -66,9 +94,18 @@ class SyncResult:
     ok: bool = True
 
 
-def idempotency_key(telegram_id: int, with_trial: bool, now: datetime) -> str:
+def trial_end_for(now: datetime, days: int) -> datetime:
+    """Checkout creation time + the trial length, cut to the minute so that taps within
+    the same minute send identical parameters (Stripe rejects a reused idempotency key
+    whose parameters differ)."""
+    ts = int((now + timedelta(days=days)).timestamp())
+    return datetime.fromtimestamp(ts - ts % 60, tz=timezone.utc)
+
+
+def idempotency_key(telegram_id: int, with_trial: bool, now: datetime, trial_end: datetime | None = None) -> str:
     bucket = int(now.timestamp()) // IDEMPOTENCY_BUCKET_SECONDS
-    return f"checkout-{telegram_id}-{'t' if with_trial else 'n'}-{bucket}"
+    key = f"checkout-{telegram_id}-{'t' if with_trial else 'n'}-{bucket}"
+    return f"{key}-{int(trial_end.timestamp())}" if trial_end is not None else key
 
 
 # --- Starting a checkout --------------------------------------------------------
@@ -81,52 +118,64 @@ async def start_checkout(svc: Services, user: User, now: datetime) -> CheckoutOf
     # someone who already has a live one.
     if user.sub_status in ENTITLED_SUB_STATUSES:
         return CheckoutOffer("already_in")
-    if user.sub_status == "past_due":
+    if user.sub_status in FIX_PAYMENT_STATUSES:
         return CheckoutOffer("fix_payment")
+    if user.sub_status == DISPUTED_STATUS:
+        return CheckoutOffer("disputed")
+    if svc.price_label is None:
+        # Never a Stripe link without the price and interval in front of it
+        # (CLAUDE.md). refresh_price reads it again every few minutes.
+        return CheckoutOffer("price_unknown")
 
     with_trial = trial_eligible(user)
     row = await svc.db.fetchone(
-        "SELECT id, url, with_trial FROM checkout_sessions "
+        "SELECT id, url, with_trial, trial_end FROM checkout_sessions "
         "WHERE telegram_id=? AND status='open' AND expires_at>? AND url IS NOT NULL "
         "ORDER BY created_at DESC LIMIT 1",
         (user.telegram_id, to_iso(now + CHECKOUT_REUSE_MARGIN)),
     )
-    if row is not None and bool(row["with_trial"]) == with_trial:
+    # A trial session is only reusable if we know its fixed trial_end (older ones don't):
+    # the date we show must be the date it charges.
+    if row is not None and bool(row["with_trial"]) == with_trial and (not with_trial or row["trial_end"]):
         log.info("Reusing open checkout %s for %s", row["id"], user.telegram_id)
-        return CheckoutOffer("checkout", url=row["url"], with_trial=with_trial, reused=True)
+        return CheckoutOffer("checkout", url=row["url"], with_trial=with_trial, reused=True,
+                             trial_end=from_iso(row["trial_end"]))
 
     customer_id = await _get_or_create_customer(svc, user, now)
-    key = idempotency_key(user.telegram_id, with_trial, now)
+    trial_end = trial_end_for(now, svc.config.trial_days) if with_trial else None
+    key = idempotency_key(user.telegram_id, with_trial, now, trial_end)
     try:
-        info = await _create_checkout(svc, user.telegram_id, customer_id, with_trial, key)
+        info = await _create_checkout(svc, user.telegram_id, customer_id, trial_end, key)
     except CustomerMissing:
         # Deleted at Stripe (e.g. test data reset): make a new customer and try once more,
         # with a new key, because the old one would replay the failed request.
         customer_id = await replace_missing_customer(svc, user.telegram_id, customer_id, now)
-        info = await _create_checkout(svc, user.telegram_id, customer_id, with_trial, f"{key}-{customer_id}")
+        info = await _create_checkout(svc, user.telegram_id, customer_id, trial_end, f"{key}-{customer_id}")
     if not info.url:
         raise StripeGatewayError("Stripe returned a checkout session without a URL")
     async with svc.db.tx() as conn:
         # OR IGNORE: a double tap inside the idempotency window returns the same session.
         cur = await conn.execute(
-            "INSERT OR IGNORE INTO checkout_sessions(id, telegram_id, created_at, expires_at, status, url, with_trial) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (info.id, user.telegram_id, to_iso(now), to_iso(info.expires_at), "open", info.url, int(with_trial)),
+            "INSERT OR IGNORE INTO checkout_sessions(id, telegram_id, created_at, expires_at, status, url, with_trial, "
+            "trial_end) VALUES(?,?,?,?,?,?,?,?)",
+            (info.id, user.telegram_id, to_iso(now), to_iso(info.expires_at), "open", info.url, int(with_trial),
+             to_iso(trial_end) if trial_end else None),
         )
         if cur.rowcount == 1:
             await audit(conn, now, user.telegram_id, "checkout_created",
-                        f"{info.id} trial={'yes' if with_trial else 'no'}")
-    return CheckoutOffer("checkout", url=info.url, with_trial=with_trial)
+                        f"{info.id} trial={'yes' if with_trial else 'no'}"
+                        + (f" trial_end={to_iso(trial_end)}" if trial_end else ""))
+    return CheckoutOffer("checkout", url=info.url, with_trial=with_trial, trial_end=trial_end)
 
 
-async def _create_checkout(svc: Services, telegram_id: int, customer_id: str, with_trial: bool,
+async def _create_checkout(svc: Services, telegram_id: int, customer_id: str, trial_end: datetime | None,
                            key: str) -> CheckoutInfo:
     assert svc.stripe is not None
     return await svc.stripe.create_checkout(
         customer_id=customer_id,
         telegram_id=telegram_id,
         price_id=svc.config.stripe_price_id,
-        trial_days=svc.config.trial_days if with_trial else None,
+        trial_end=trial_end,
         success_url=svc.config.stripe_success_url,
         cancel_url=svc.config.stripe_cancel_url,
         idempotency_key=key,
@@ -218,10 +267,15 @@ async def write_subscription(
     *,
     sync_started: datetime | None = None,
     snapshot_ids: frozenset[str] = frozenset(),
+    clear_dispute: bool = False,
 ) -> bool:
     """Store sub on the user. The full sync passes sync_started (and the ids it
     listed for this user); then the write is skipped, returning False, when a
-    checkout poll stored newer data meanwhile. The next sync writes it."""
+    checkout poll stored newer data meanwhile. The next sync writes it.
+
+    A user whose sub_status is the local "disputed" keeps it: Stripe knows nothing
+    of it, so every other field is refreshed but the status is left alone. Only
+    the disputes check passes clear_dispute=True, once the dispute is resolved."""
     async with db.tx() as conn:
         cur = await conn.execute(
             "SELECT stripe_sub_id, sub_status, past_due_since, last_synced_at FROM users WHERE telegram_id=?",
@@ -233,6 +287,8 @@ async def write_subscription(
             return False
         # The past-due grace runs from the first unpaid period, even if Stripe is
         # set to leave the subscription past_due and keeps starting new periods.
+        keep_disputed = not clear_dispute and old is not None and old["sub_status"] == DISPUTED_STATUS
+        status = DISPUTED_STATUS if keep_disputed else sub.status
         past_due_since = None
         if sub.status == "past_due":
             same_sub = old is not None and old["stripe_sub_id"] == sub.id
@@ -243,7 +299,7 @@ async def write_subscription(
             "sub_trial_end=?, past_due_since=?, cancel_at_period_end=?, last_synced_at=? WHERE telegram_id=?",
             (
                 sub.id,
-                sub.status,
+                status,
                 to_iso(sub.period_start) if sub.period_start else None,
                 to_iso(sub.period_end) if sub.period_end else None,
                 to_iso(sub.trial_end) if sub.trial_end else None,
@@ -269,9 +325,9 @@ async def write_subscription(
             if cur.rowcount == 1:
                 await audit(conn, now, telegram_id, "trial_started",
                             f"{sub.id} ends {to_iso(sub.trial_end) if sub.trial_end else '?'}")
-        if old is None or (old["stripe_sub_id"], old["sub_status"]) != (sub.id, sub.status):
+        if old is None or (old["stripe_sub_id"], old["sub_status"]) != (sub.id, status):
             before = old["sub_status"] if old is not None and old["sub_status"] else "none"
-            await audit(conn, now, telegram_id, "sub_status", f"{sub.id}: {before} -> {sub.status}")
+            await audit(conn, now, telegram_id, "sub_status", f"{sub.id}: {before} -> {status}")
     return True
 
 
@@ -302,6 +358,13 @@ async def poll_checkouts(svc: Services, now: datetime, only_telegram_id: int | N
         result.checked += 1
         try:
             info = await svc.stripe.get_checkout(row["id"])
+        except CheckoutMissing:
+            # Stripe has no such session (test data deleted, or another account's
+            # key), so it can never be paid. Not an error worth retrying.
+            await _set_checkout_status(svc.db, row["id"], row["telegram_id"], "expired", now,
+                                       "no longer at Stripe")
+            result.expired += 1
+            continue
         except StripeGatewayError:
             result.errors += 1
             expires_at = from_iso(row["expires_at"])
@@ -398,6 +461,7 @@ async def sync_subscriptions(svc: Services, now: datetime) -> SyncResult:
     # (test-clock subscriptions aren't listed, a poll may have just stored a new
     # one), so ask Stripe for it. Only "no such subscription" marks it missing.
     listed = {s.id for s in subs}
+    missing: list[str] = []
     for row in await svc.db.fetchall(
         "SELECT telegram_id, stripe_sub_id FROM users WHERE stripe_sub_id IS NOT NULL AND sub_status IS NOT ?",
         (MISSING_STATUS,),
@@ -408,22 +472,29 @@ async def sync_subscriptions(svc: Services, now: datetime) -> SyncResult:
             sub = await svc.stripe.get_subscription(row["stripe_sub_id"])
         except SubscriptionMissing:
             if row["telegram_id"] not in groups:   # otherwise their listed subs replace it below
-                await _mark_sub_missing(svc.db, row["telegram_id"], row["stripe_sub_id"], now)
+                if await _mark_sub_missing(svc.db, row["telegram_id"], row["stripe_sub_id"], now):
+                    missing.append(f"user {row['telegram_id']}: {row['stripe_sub_id']}")
             continue
         except StripeGatewayError:
             result.ok = False
             continue
         groups.setdefault(row["telegram_id"], []).append(sub)
 
+    duplicates: list[str] = []
+    duplicate_ids: list[str] = []
     for telegram_id, user_subs in groups.items():
         try:
-            live = sorted(s.id for s in user_subs if s.status not in TERMINAL_STATUSES)
+            live = sorted((s for s in user_subs if s.status not in TERMINAL_STATUSES), key=lambda s: s.id)
             if len(live) > 1:
-                # TODO(phase 4): also alert the owner (rate-limited owner alerts).
-                log.warning("User %s has %d live subscriptions: %s", telegram_id, len(live), ", ".join(live))
+                ids = [s.id for s in live]
+                # With the status next to each id the owner can tell which one to cancel.
+                listed = ", ".join(f"{s.id} ({s.status})" for s in live)
+                log.warning("User %s has %d live subscriptions: %s", telegram_id, len(live), listed)
                 result.multiple.append(telegram_id)
+                duplicates.append(f"user {telegram_id}: {listed}")
+                duplicate_ids.append(f"user {telegram_id}: {', '.join(ids)}")
                 async with svc.db.tx() as conn:
-                    await audit_if_changed(conn, now, telegram_id, "multiple_subs", " ".join(live))
+                    await audit_if_changed(conn, now, telegram_id, "multiple_subs", " ".join(ids))
             # `now` was taken before the listing, so it is when this snapshot started.
             if await write_subscription(svc.db, telegram_id, pick_best(user_subs), now, sync_started=now,
                                         snapshot_ids=frozenset(s.id for s in user_subs)):
@@ -434,22 +505,80 @@ async def sync_subscriptions(svc: Services, now: datetime) -> SyncResult:
             log.exception("Sync failed for user %s", telegram_id)
             result.ok = False
 
-    # TODO(phase 3): daily disputes check (set sub_status 'disputed', alert the owner).
+    # Disputes are checked by their own daily job (disputes.check_disputes).
     if result.ok:
         async with svc.db.tx() as conn:
             await kv_set(conn, LAST_FULL_SYNC_KEY, to_iso(now))
     log.info("Stripe sync: %d subscriptions, %d users updated, %d left for next sync, %d unmatched, ok=%s",
              result.subscriptions, result.users_updated, result.skipped, result.unmatched, result.ok)
+    # One alert per kind for the whole sync, after it: alert_owner never raises, so a
+    # failed DM can't fail the sync. Duplicates are keyed by exactly who and which
+    # subscriptions (not their statuses), so a new one is alerted at once, while ones
+    # nobody has sorted out yet are a daily reminder rather than one every 30 minutes.
+    if duplicates:
+        key = hashlib.sha256("\n".join(duplicate_ids).encode()).hexdigest()[:12]
+        await alert_owner(svc, f"multiple_subs:{key}", "\n".join([
+            "⚠️ <b>More than one live subscription</b>",
+            _alert_list(duplicates),
+            "Access comes from the best one. Cancel the extra one in the Stripe dashboard so they "
+            "aren't charged twice. Until then this reminder comes once a day.",
+        ]), now, interval=DUPLICATE_REMINDER)
+    if missing:
+        await alert_owner(svc, "sub_missing", "\n".join([
+            "⚠️ <b>Subscription no longer at Stripe</b>",
+            _alert_list(missing),
+            "It no longer gives access (status 'missing'). That's expected if you deleted test data; "
+            "otherwise look in the Stripe dashboard. Any more in the next 30 minutes are only logged "
+            "and audited (/user shows them).",
+        ]), now)
     return result
 
 
-async def _mark_sub_missing(db: Database, telegram_id: int, sub_id: str, now: datetime) -> None:
+def _alert_list(items: list[str]) -> str:
+    shown = "\n".join(html.escape(item) for item in items[:ALERT_LIST_LIMIT])
+    extra = len(items) - ALERT_LIST_LIMIT
+    return shown + (f"\n… and {extra} more" if extra > 0 else "")
+
+
+async def _mark_sub_missing(db: Database, telegram_id: int, sub_id: str, now: datetime) -> bool:
+    """True if this call marked it, so each one is alerted once."""
     async with db.tx() as conn:
         cur = await conn.execute(
             "UPDATE users SET sub_status=?, past_due_since=NULL WHERE telegram_id=? AND stripe_sub_id=?",
             (MISSING_STATUS, telegram_id, sub_id),
         )
-        if cur.rowcount == 1:
-            # TODO(phase 4): also alert the owner.
-            log.warning("Subscription %s of %s no longer exists at Stripe; marked missing", sub_id, telegram_id)
-            await audit(conn, now, telegram_id, "sub_missing", sub_id)
+        if cur.rowcount != 1:
+            return False
+        log.warning("Subscription %s of %s no longer exists at Stripe; marked missing", sub_id, telegram_id)
+        await audit(conn, now, telegram_id, "sub_missing", sub_id)
+    return True
+
+
+# --- The price ----------------------------------------------------------------------
+
+async def read_price(stripe: StripeGateway, price_id: str, *, sleep=asyncio.sleep) -> str | None:
+    """The price label ("£2.99/month") at startup, with a few quick retries, as a
+    blip while the machine boots shouldn't hold back checkouts. None if it still
+    couldn't be read; refresh_price then keeps trying."""
+    for delay in (0.0, *PRICE_RETRY_DELAYS):
+        if delay:
+            await sleep(delay)
+        label = await stripe.price_label(price_id)
+        if label is not None:
+            return label
+    return None
+
+
+async def refresh_price(svc: Services) -> str | Skipped:
+    """Scheduler job: while the price is unknown, read it from Stripe again.
+    Raises while it still can't be read, so a lasting problem reaches the owner;
+    SKIPPED once the price is known."""
+    if svc.stripe is None or svc.price_label is not None:
+        return SKIPPED
+    label = await svc.stripe.price_label(svc.config.stripe_price_id)
+    if label is None:
+        raise StripeGatewayError(f"couldn't read the price {svc.config.stripe_price_id} from Stripe, "
+                                 "so trial and subscribe checkouts are held back")
+    svc.price.label = label
+    log.warning("Read the Stripe price: %s. Trial and subscribe checkouts are open again.", label)
+    return label

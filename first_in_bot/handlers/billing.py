@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 
 from aiogram import F, Router
@@ -30,6 +30,7 @@ from ..models import User
 from ..services import Services
 from ..status import status_text
 from ..stripe_gateway import CustomerMissing, PortalNotConfigured, StripeGatewayError
+from ..timeutil import format_local_date
 from ..users import get_user
 
 log = logging.getLogger(__name__)
@@ -38,12 +39,31 @@ router = Router(name="billing")
 router.message.filter(F.chat.type == "private")
 router.callback_query.filter(F.message.chat.type == "private")
 
+# Instead of a checkout link while the price couldn't be read from Stripe: the
+# price and interval must come before any Stripe link, and the bot reads it again
+# every few minutes (billing.refresh_price).
+PRICE_UNKNOWN = "Sorry, payments are briefly unavailable. Please try again in a few minutes."
+
 
 @dataclass(frozen=True)
 class Reply:
     text: str
     markup: InlineKeyboardMarkup | None = None
     alert: bool = False   # short; shown as a callback alert when it came from a button
+
+
+def contact_line(svc: Services) -> str:
+    support = svc.config.support_contact
+    return texts.CONTACT_SUPPORT.format(support=html.escape(support)) if support else texts.CONTACT_LATER
+
+
+def trial_terms_text(svc: Services, now: datetime, trial_end: datetime | None = None) -> str:
+    """The trial facts. With a checkout's own trial_end the date is exact; without one
+    (/terms) it is the date for someone starting today."""
+    config = svc.config
+    charge = trial_end if trial_end is not None else now + timedelta(days=config.trial_days)
+    return texts.trial_terms(svc.price_label, config.trial_days, format_local_date(charge, config.timezone),
+                             fixed=trial_end is not None)
 
 
 def local_reply(svc: Services, user: User | None) -> Reply | None:
@@ -72,9 +92,16 @@ async def checkout_reply(svc: Services, telegram_id: int, now: datetime, wanted_
         return Reply(texts.ALREADY_SUBSCRIBED, None if user.in_paid_channel else join_channel_keyboard(svc.config))
     if offer.kind == "fix_payment":
         return Reply(texts.PAYMENT_PROBLEM, manage_keyboard())
+    if offer.kind == "disputed":
+        return Reply(texts.DISPUTED_NO_CHECKOUT.format(contact=contact_line(svc)))
+    if offer.kind == "price_unknown":
+        return Reply(PRICE_UNKNOWN)
     assert offer.url is not None
-    price = texts.price_text(svc.price_label)
-    body = (texts.CHECKOUT_TRIAL if offer.with_trial else texts.CHECKOUT_SUBSCRIBE).format(price=price)
+    if offer.with_trial:
+        assert offer.trial_end is not None
+        body = texts.CHECKOUT_TRIAL.format(terms=trial_terms_text(svc, now, offer.trial_end))
+    else:
+        body = texts.CHECKOUT_SUBSCRIBE.format(price=texts.price_text(svc.price_label))
     if wanted_trial and not offer.with_trial:
         body = texts.ALREADY_HAD_TRIAL + "\n\n" + body
     body += "\n\n" + texts.CHECKOUT_AFTER.format(done_button=html.escape(done_label(offer.with_trial)))
@@ -88,21 +115,18 @@ async def manage_reply(svc: Services, telegram_id: int, now: datetime) -> Reply:
         return early
     assert user is not None and svc.stripe is not None
     if not user.stripe_customer_id:
-        return Reply(texts.MANAGE_NO_CUSTOMER, subscribe_keyboard(user))
+        return Reply(texts.MANAGE_NO_CUSTOMER, subscribe_keyboard(user, svc.config.trial_days))
     try:
         url = await svc.stripe.portal_url(user.stripe_customer_id, svc.config.bot_link)
     except PortalNotConfigured:
         log.error("Customer Portal is not activated: Stripe dashboard > Settings > Billing > Customer portal")
-        support = svc.config.support_contact
-        contact = (texts.CONTACT_SUPPORT.format(support=html.escape(support)) if support
-                   else texts.CONTACT_LATER)
-        return Reply(texts.MANAGE_PORTAL_OFF.format(contact=contact))
+        return Reply(texts.MANAGE_PORTAL_OFF.format(contact=contact_line(svc)))
     except CustomerMissing:
         # Deleted at Stripe (e.g. test data reset), so there's nothing to manage.
         # Forget it; their next checkout creates a new customer.
         await forget_missing_customer(svc.db, telegram_id, user.stripe_customer_id, now)
         user = await get_user(svc.db, telegram_id)
-        return Reply(texts.MANAGE_NO_CUSTOMER, subscribe_keyboard(user))
+        return Reply(texts.MANAGE_NO_CUSTOMER, subscribe_keyboard(user, svc.config.trial_days))
     except StripeGatewayError:
         return Reply(texts.STRIPE_ERROR)
     return Reply(texts.MANAGE_LINK, portal_keyboard(url))
@@ -115,7 +139,7 @@ async def status_reply(svc: Services, telegram_id: int, now: datetime) -> Reply:
     text = status_text(user, now, svc.config, svc.price_label)
     markup = None
     if not user.banned and not svc.entitled(user, now):
-        markup = subscribe_keyboard(user)
+        markup = subscribe_keyboard(user, svc.config.trial_days)
     return Reply(text, markup)
 
 
@@ -217,7 +241,11 @@ async def cmd_status(message: Message, svc: Services) -> None:
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, svc: Services) -> None:
-    await message.answer(texts.HELP)
+    text = texts.HELP
+    # Same check as handlers.admin.is_admin, kept here so only admins learn the commands exist.
+    if message.from_user is not None and message.from_user.id in svc.config.admin_ids:
+        text += "\n\n" + texts.HELP_ADMIN
+    await message.answer(text)
 
 
 @router.message(Command("terms"))
@@ -225,7 +253,11 @@ async def cmd_terms(message: Message, svc: Services) -> None:
     support = svc.config.support_contact
     support_line = texts.TERMS_SUPPORT.format(support=html.escape(support)) if support else ""
     await message.answer(
-        texts.TERMS.format(price=texts.price_text(svc.price_label), support_line=support_line).rstrip()
+        texts.TERMS.format(
+            trial_terms=trial_terms_text(svc, svc.now()),
+            reminder_days=svc.config.trial_reminder_days_before,
+            support_line=support_line,
+        ).rstrip()
     )
 
 

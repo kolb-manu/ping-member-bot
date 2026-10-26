@@ -31,7 +31,7 @@ Every video follows the same layout:
 | Hashtags | `#exeter #exeteruni #universityofexeter #timepiece #tpwednesday #freshers #fyp` |
 
 - No brand-name hashtags for FIXR.
-- Only say "free" in a video once the trial is actually live.
+- Only say "free" in a video once the trial is actually live. The trial needs a card and charges automatically after 14 days, so never imply it is card-free or free forever; say "card needed" or "cancel any time before day 14".
 - Sounds and clips may get muted over time. That's accepted while we're small.
 
 ## 1. The Overheard fresher
@@ -102,7 +102,7 @@ When you open the flat group chat to "TP JUST DROPPED MORE TICKETS" sent 4 minut
 The one guy in the flat who got First In in freshers, hasn't missed a TP Wednesday since, and has never once paid Overheard prices
 
 **Bottom line:**
-first 2 weeks free, link in bio ↓
+first 2 weeks free (card needed to start), link in bio ↓
 
 ## Posting order and tracking
 

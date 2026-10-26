@@ -22,6 +22,11 @@ def from_iso(value: str | None) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def format_local_date(dt: datetime, tz: ZoneInfo) -> str:
+    """Date only, for the first-charge date, e.g. '15 Nov 2026'."""
+    local = dt.astimezone(tz)
+    return f"{local.day} {local:%b %Y}"
+
 def format_local(dt: datetime, tz: ZoneInfo) -> str:
     """For showing times to users, e.g. '3 Nov 2026, 18:30'."""
     local = dt.astimezone(tz)

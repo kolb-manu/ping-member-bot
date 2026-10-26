@@ -204,7 +204,9 @@ async def test_upgrade_from_schema_2_keeps_past_due_access(tmp_path):
 
     d = await Database.open(path)
     try:
-        assert (await d.fetchone("SELECT value FROM kv WHERE key='schema_version'"))["value"] == "3"
+        assert (await d.fetchone("SELECT value FROM kv WHERE key='schema_version'"))["value"] == str(
+            len(db_module.MIGRATIONS))
+        assert await d.fetchall("SELECT * FROM disputes") == []
         user = await get_user(d, 1)
         assert user.sub_period_start is None and user.past_due_since is None
         assert is_entitled(user, NOW, timedelta(hours=72))

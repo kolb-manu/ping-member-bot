@@ -1,4 +1,5 @@
 """Checkout, payment polling, applying subscriptions and the full sync."""
+import dataclasses
 from datetime import timedelta
 
 import pytest
@@ -13,11 +14,11 @@ from first_in_bot.billing import (
     sync_subscriptions,
 )
 from first_in_bot.services import Services
-from first_in_bot.stripe_gateway import StripeGatewayError, parse_subscription
+from first_in_bot.stripe_gateway import CheckoutMissing, StripeGatewayError, parse_subscription
 from first_in_bot.telegram_gateway import SendResult
 from first_in_bot.timeutil import from_iso, to_iso
 from first_in_bot.users import get_user
-from tests.fakes import NOW, FakeStripe, add_user, audit_actions, sub_info, trial_sub
+from tests.fakes import NOW, OWNER, PRICE, FakeStripe, add_user, audit_actions, sub_info, trial_sub
 from tests.test_stripe_gateway import sub_payload
 
 M = timedelta(minutes=1)
@@ -35,12 +36,16 @@ async def test_trial_checkout_when_eligible(svc, stripe_fake):
     assert offer.kind == "checkout" and offer.with_trial and not offer.reused
     assert offer.url == "https://checkout.stripe.test/cs_1"
     call = stripe_fake.created[0]
-    assert call["trial_days"] == 14 and call["customer_id"] == "cus_1" and call["telegram_id"] == 1
+    trial_end = NOW + timedelta(days=14)          # checkout creation time + TRIAL_DAYS, a fixed moment
+    assert call["trial_end"] == trial_end and offer.trial_end == trial_end
+    assert "trial_days" not in call
+    assert call["customer_id"] == "cus_1" and call["telegram_id"] == 1
     assert call["price_id"] == "price_123"
-    assert call["idempotency_key"] == idempotency_key(1, True, NOW)
+    assert call["idempotency_key"] == idempotency_key(1, True, NOW, trial_end)
     assert call["idempotency_key"].startswith("checkout-1-t-")
     rows = await checkout_rows(svc.db)
     assert len(rows) == 1 and rows[0]["status"] == "open" and rows[0]["with_trial"] == 1
+    assert from_iso(rows[0]["trial_end"]) == trial_end
     assert rows[0]["url"] == offer.url and from_iso(rows[0]["expires_at"]) == NOW + timedelta(hours=24)
     assert (await get_user(svc.db, 1)).stripe_customer_id == "cus_1"
     assert (await get_user(svc.db, 1)).trial_ends_at is None   # no bot-side trial any more
@@ -51,14 +56,14 @@ async def test_no_trial_once_trial_used(svc, stripe_fake):
     user = await add_user(svc.db, 1, trial_started_at=NOW - timedelta(days=30))
     offer = await start_checkout(svc, user, NOW)
     assert not offer.with_trial
-    assert stripe_fake.created[0]["trial_days"] is None
+    assert stripe_fake.created[0]["trial_end"] is None and offer.trial_end is None
     assert "-n-" in stripe_fake.created[0]["idempotency_key"]
 
 
 async def test_no_trial_after_any_subscription(svc, stripe_fake):
     user = await add_user(svc.db, 1, stripe_sub_id="sub_old", sub_status="canceled", stripe_customer_id="cus_1")
     offer = await start_checkout(svc, user, NOW)
-    assert not offer.with_trial and stripe_fake.created[0]["trial_days"] is None
+    assert not offer.with_trial and stripe_fake.created[0]["trial_end"] is None
     assert stripe_fake.customers == []  # existing customer reused
 
 
@@ -108,18 +113,35 @@ async def test_customer_stored_meanwhile_wins(svc):
             return "cus_second"
 
     racing = RacingStripe()
-    svc2 = Services(db=svc.db, config=svc.config, tg=svc.tg, stripe=racing, price_label=None)
+    svc2 = Services(db=svc.db, config=svc.config, tg=svc.tg, stripe=racing, price_label=PRICE)
     await start_checkout(svc2, await add_user(svc.db, 1), NOW)
     assert (await get_user(svc.db, 1)).stripe_customer_id == "cus_first"
     assert racing.created[0]["customer_id"] == "cus_first"
 
 
 @pytest.mark.parametrize("status,kind", [("active", "already_in"), ("trialing", "already_in"),
-                                         ("past_due", "fix_payment")])
+                                         ("past_due", "fix_payment"), ("unpaid", "fix_payment")])
 async def test_existing_subscription_gets_no_new_checkout(svc, stripe_fake, status, kind):
+    # unpaid is still a live subscription (paying its open invoice in the portal brings
+    # it back), so a new checkout would only make a duplicate.
     user = await add_user(svc.db, 1, stripe_sub_id="sub_1", sub_status=status)
     offer = await start_checkout(svc, user, NOW)
     assert offer.kind == kind and stripe_fake.created == []
+
+
+async def test_no_checkout_link_while_the_price_is_unknown(svc, stripe_fake):
+    # The price and interval must come before any Stripe link, so with the price
+    # unread no session is made or handed out again until it is known.
+    user = await add_user(svc.db, 1)
+    await start_checkout(svc, user, NOW)
+    svc.price.label = None
+    for fresh in (await get_user(svc.db, 1), await add_user(svc.db, 2)):
+        offer = await start_checkout(svc, fresh, NOW + M)
+        assert offer.kind == "price_unknown" and offer.url is None
+    assert len(stripe_fake.created) == 1 and stripe_fake.customers == [(1, "user1")]
+    # Someone with a subscription still hears about that rather than about the price.
+    subscribed = await add_user(svc.db, 3, stripe_sub_id="sub_3", sub_status="active")
+    assert (await start_checkout(svc, subscribed, NOW)).kind == "already_in"
 
 
 def test_idempotency_key_buckets():
@@ -152,7 +174,7 @@ async def test_completed_trial_checkout_applies_sub_and_welcomes_once(svc, strip
     messages = tg.sent_to(1)
     assert len(messages) == 1
     assert "free trial is on until <b>15 Nov 2026, 12:00</b>" in messages[0]
-    assert "£2.99/month is charged automatically" in messages[0]
+    assert "first payment of £2.99/month is taken on that date" in messages[0]
     join = tg.markups_to(1)[0].inline_keyboard[0][0]
     assert join.url == svc.config.paid_join_request_link
 
@@ -203,12 +225,30 @@ async def test_poll_only_one_user(svc, stripe_fake):
 
 async def test_poll_stripe_down(svc, stripe_fake):
     await started(svc)
+    assert (await poll_checkouts(svc, NOW)).ok
     stripe_fake.fail_get = True
     result = await poll_checkouts(svc, NOW + M)
     assert result.errors == 1 and (await checkout_rows(svc.db))[0]["status"] == "open"
+    # Not ok, so the scheduler counts it as failed and alerts if it keeps up.
+    assert result.ok is False
     # Long after expiry and still not retrievable: stop asking.
     result = await poll_checkouts(svc, NOW + timedelta(days=3))
     assert result.expired == 1 and (await checkout_rows(svc.db))[0]["status"] == "expired"
+
+
+async def test_poll_session_stripe_no_longer_has_is_expired_not_an_error(svc, stripe_fake):
+    # E.g. test data deleted at Stripe: it can never be paid, so asking every 30 s
+    # (and failing the job for a day or two) would only make noise.
+    await started(svc)
+
+    async def missing(session_id):
+        raise CheckoutMissing(f"Stripe has no checkout session {session_id}")
+
+    stripe_fake.get_checkout = missing
+    result = await poll_checkouts(svc, NOW + M)
+    assert result.ok and result.errors == 0 and result.expired == 1
+    assert (await checkout_rows(svc.db))[0]["status"] == "expired"
+    assert "checkout_expired" in await audit_actions(svc.db, 1)
 
 
 async def test_poll_without_stripe_does_nothing(db, tg):
@@ -322,6 +362,28 @@ async def test_sync_unmatched_subscriptions_dont_fail_the_sync(svc, stripe_fake)
     result = await sync_subscriptions(svc, NOW)
     assert result.ok and result.unmatched == 1
     assert await svc.db.kv_get(LAST_FULL_SYNC_KEY) == to_iso(NOW)
+
+
+async def test_sync_leaves_a_payment_link_subscription_alone(svc, stripe_fake, tg):
+    # A Stripe Payment Link (the personal-alerts design, desk check D3) makes its own
+    # customer and puts no telegram_id on anything: the bot can't tie it to anyone,
+    # so it must change nobody, DM nobody and not fail the sync.
+    await add_user(svc.db, 1)
+    await apply_subscription(svc.db, trial_sub(1), NOW)
+    before = await get_user(svc.db, 1)
+    audits = await audit_actions(svc.db)
+    link_sub = parse_subscription(sub_payload(id="sub_link", customer="cus_from_link", metadata={}))
+    assert link_sub.telegram_id is None
+    stripe_fake.subscriptions = [trial_sub(1), link_sub]
+    result = await sync_subscriptions(svc, NOW + M)
+    assert result.ok and result.unmatched == 1 and not result.multiple
+    after = await get_user(svc.db, 1)
+    # Their own subscription was synced as usual; nothing else about them changed.
+    assert after.last_synced_at == NOW + M
+    assert dataclasses.replace(after, last_synced_at=before.last_synced_at) == before
+    assert await audit_actions(svc.db) == audits
+    assert tg.events == []
+    assert (await svc.db.fetchone("SELECT count(*) AS n FROM users"))["n"] == 1
 
 
 # --- past-due anchor -------------------------------------------------------------------
@@ -444,7 +506,7 @@ async def test_deleted_customer_replaced_and_checkout_retried(svc, stripe_fake):
     user = await get_user(svc.db, 1)
     assert user.stripe_customer_id == "cus_1"
     assert [c["customer_id"] for c in stripe_fake.created] == ["cus_1"]
-    assert stripe_fake.created[0]["idempotency_key"] == idempotency_key(1, True, NOW) + "-cus_1"
+    assert stripe_fake.created[0]["idempotency_key"] == idempotency_key(1, True, NOW, NOW + timedelta(days=14)) + "-cus_1"
     actions = await audit_actions(svc.db, 1)
     assert "stripe_customer_missing" in actions and "checkout_created" in actions
 
@@ -461,3 +523,167 @@ async def test_sync_mid_listing_poll_with_retrieve_keeps_new_sub(svc, stripe_fak
     assert result.ok and stripe_fake.retrieved == ["sub_new"]
     user = await get_user(svc.db, 1)
     assert user.stripe_sub_id == "sub_new" and svc.entitled(user, NOW)
+
+
+# --- the fixed trial_end -----------------------------------------------------------------
+
+def test_trial_end_is_creation_time_plus_trial_days_cut_to_the_minute():
+    from first_in_bot.billing import trial_end_for
+
+    odd = NOW + timedelta(seconds=37)
+    assert trial_end_for(odd, 14) == NOW + timedelta(days=14)
+    assert trial_end_for(NOW, 3) == NOW + timedelta(days=3)
+    assert trial_end_for(odd, 14).tzinfo is not None
+
+
+def test_idempotency_key_differs_when_the_trial_end_differs():
+    a = NOW + timedelta(days=14)
+    assert idempotency_key(1, True, NOW, a) == idempotency_key(1, True, NOW + 30 * timedelta(seconds=1), a)
+    assert idempotency_key(1, True, NOW, a) != idempotency_key(1, True, NOW, a + timedelta(minutes=1))
+
+
+async def test_reused_session_keeps_its_original_trial_end(svc, stripe_fake):
+    user = await add_user(svc.db, 1)
+    first = await start_checkout(svc, user, NOW)
+    later = NOW + timedelta(hours=20)             # still inside the session's 24h life
+    second = await start_checkout(svc, await get_user(svc.db, 1), later)
+    assert second.reused and second.url == first.url
+    assert second.trial_end == first.trial_end == NOW + timedelta(days=14)   # not later + 14 days
+    assert len(stripe_fake.created) == 1
+
+
+async def test_open_trial_session_without_a_stored_trial_end_is_not_reused(svc, stripe_fake):
+    user = await add_user(svc.db, 1)
+    await start_checkout(svc, user, NOW)
+    async with svc.db.tx() as conn:               # as if made before migration 5
+        await conn.execute("UPDATE checkout_sessions SET trial_end=NULL")
+    offer = await start_checkout(svc, await get_user(svc.db, 1), NOW + 20 * M)
+    assert not offer.reused and offer.trial_end == NOW + 20 * M + timedelta(days=14)
+    assert len(stripe_fake.created) == 2
+
+
+# --- owner alerts from the sync -------------------------------------------------------------
+
+async def test_multiple_live_subscriptions_alert_the_owner_rate_limited(svc, stripe_fake, tg):
+    await add_user(svc.db, 1)
+    await add_user(svc.db, 2)
+    stripe_fake.subscriptions = [
+        sub_info(id="sub_a", status="active"), sub_info(id="sub_b", status="trialing", created=NOW + M),
+        sub_info(id="sub_c", status="active", telegram_id=2, customer="cus_2"),
+        sub_info(id="sub_d", status="past_due", telegram_id=2, customer="cus_2"),
+    ]
+    await sync_subscriptions(svc, NOW)
+    [alert] = tg.sent_to(OWNER)
+    assert "More than one live subscription" in alert
+    # One DM for everyone, with each subscription's status so the owner knows which to cancel.
+    assert "user 1: sub_a (active), sub_b (trialing)\nuser 2: sub_c (active), sub_d (past_due)" in alert
+    await sync_subscriptions(svc, NOW + 5 * M)
+    await sync_subscriptions(svc, NOW + 30 * M)
+    assert len(tg.sent_to(OWNER)) == 1                                  # not every sync, nor every 30 min
+    await sync_subscriptions(svc, NOW + 24 * 60 * M)
+    assert len(tg.sent_to(OWNER)) == 2                                  # a daily reminder while it lasts
+
+
+async def test_a_new_duplicate_is_alerted_at_once(svc, stripe_fake, tg):
+    await add_user(svc.db, 1)
+    await add_user(svc.db, 2)
+    stripe_fake.subscriptions = [sub_info(id="sub_a"), sub_info(id="sub_b", created=NOW + M)]
+    await sync_subscriptions(svc, NOW)
+    stripe_fake.subscriptions += [sub_info(id="sub_c", telegram_id=2, customer="cus_2"),
+                                  sub_info(id="sub_d", telegram_id=2, customer="cus_2", created=NOW + M)]
+    await sync_subscriptions(svc, NOW + 5 * M)
+    first, second = tg.sent_to(OWNER)
+    assert "user 2" not in first and "user 2: sub_c (active), sub_d (active)" in second
+
+
+async def test_a_status_change_is_no_new_duplicate(svc, stripe_fake, tg):
+    # The reminder is keyed by who and which subscriptions, not their statuses.
+    await add_user(svc.db, 1)
+    stripe_fake.subscriptions = [sub_info(id="sub_old", status="unpaid"),
+                                 sub_info(id="sub_new", status="trialing", created=NOW + M)]
+    await sync_subscriptions(svc, NOW)
+    stripe_fake.subscriptions[1] = sub_info(id="sub_new", status="active", created=NOW + M)
+    await sync_subscriptions(svc, NOW + 5 * M)
+    [alert] = tg.sent_to(OWNER)
+    assert "user 1: sub_new (trialing), sub_old (unpaid)" in alert
+
+
+async def test_subscription_gone_from_stripe_alerts_once(svc, stripe_fake, tg):
+    await add_user(svc.db, 1)
+    await apply_subscription(svc.db, sub_info(id="sub_gone", status="trialing"), NOW - timedelta(days=1))
+    await sync_subscriptions(svc, NOW)
+    [alert] = tg.sent_to(OWNER)
+    assert "Subscription no longer at Stripe" in alert and "user 1: sub_gone" in alert
+    await sync_subscriptions(svc, NOW + 31 * M)
+    assert len(tg.sent_to(OWNER)) == 1                                  # marked once, so alerted once
+
+
+async def test_a_failing_alert_never_fails_the_sync(svc, stripe_fake, tg, monkeypatch):
+    async def exploding_send(*args, **kwargs):
+        raise RuntimeError("Telegram is down")
+
+    monkeypatch.setattr(tg, "send", exploding_send)
+    await add_user(svc.db, 1)
+    await add_user(svc.db, 2)
+    await apply_subscription(svc.db, sub_info(id="sub_gone", telegram_id=2, customer="cus_2"),
+                             NOW - timedelta(days=1))
+    stripe_fake.subscriptions = [sub_info(id="sub_a"), sub_info(id="sub_b", created=NOW + M)]
+    result = await sync_subscriptions(svc, NOW)
+    assert result.ok and result.multiple == [1]
+    assert await svc.db.kv_get(LAST_FULL_SYNC_KEY) == to_iso(NOW)
+    assert (await get_user(svc.db, 2)).sub_status == billing.MISSING_STATUS
+
+
+# --- the price ----------------------------------------------------------------------------
+
+class PriceStripe(FakeStripe):
+    """price_label gives None (couldn't read it) until `good_from` calls have been made."""
+
+    def __init__(self, good_from: int):
+        super().__init__()
+        self.good_from = good_from
+        self.price_calls = 0
+
+    async def price_label(self, price_id):
+        self.price_calls += 1
+        return PRICE if self.price_calls >= self.good_from else None
+
+
+async def test_startup_price_read_retries_with_short_pauses():
+    pauses = []
+
+    async def sleep(seconds):
+        pauses.append(seconds)
+
+    assert await billing.read_price(PriceStripe(good_from=3), "price_123", sleep=sleep) == PRICE
+    assert pauses == list(billing.PRICE_RETRY_DELAYS) and sum(pauses) < 10
+    pauses.clear()
+    never = PriceStripe(good_from=99)
+    assert await billing.read_price(never, "price_123", sleep=sleep) is None
+    assert never.price_calls == 1 + len(billing.PRICE_RETRY_DELAYS)
+
+
+async def test_refresh_price_fills_in_an_unknown_price_without_a_restart(svc, stripe_fake):
+    from first_in_bot.daily import SKIPPED
+    from first_in_bot.handlers.billing import checkout_reply
+
+    stripe = PriceStripe(good_from=2)
+    svc = Services(db=svc.db, config=svc.config, tg=svc.tg, stripe=stripe, price_label=None, clock=svc.clock)
+    await add_user(svc.db, 1)
+    with pytest.raises(StripeGatewayError, match="couldn't read the price"):
+        await billing.refresh_price(svc)        # still unreadable: a failed run
+    assert svc.price_label is None
+    assert await billing.refresh_price(svc) == PRICE
+    assert svc.price_label == PRICE
+    assert await billing.refresh_price(svc) is SKIPPED   # known: nothing more to ask Stripe
+    assert stripe.price_calls == 2
+    # Every reader sees it straight away, the checkout reply included.
+    reply = await checkout_reply(svc, 1, NOW, wanted_trial=True)
+    assert "then <b>£2.99/month</b>" in reply.text and reply.markup is not None
+
+
+async def test_refresh_price_does_nothing_without_stripe(db, tg):
+    from first_in_bot.daily import SKIPPED
+    from tests.fakes import make_svc
+
+    assert await billing.refresh_price(make_svc(db, tg, None)) is SKIPPED

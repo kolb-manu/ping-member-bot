@@ -10,8 +10,9 @@ from aiogram.types import Update
 
 from first_in_bot import texts
 from first_in_bot.main import ALLOWED_UPDATES, build_dispatcher
+from first_in_bot.maintenance import paused_since, set_paused
 from first_in_bot.users import get_user
-from tests.fakes import OWNER, PRICE, add_user, audit_actions, make_svc
+from tests.fakes import NOW, OWNER, PRICE, add_user, audit_actions, make_svc
 from tests.test_config import TOKEN
 
 _DP = None
@@ -79,7 +80,7 @@ def test_allowed_updates():
 async def test_start_sends_welcome(wiring):
     svc, feed = wiring
     [req] = await feed(message(5, "/start tt_v1"))
-    assert isinstance(req, SendMessage) and "Your first 2 weeks are free, then £2.99/month" in req.text
+    assert isinstance(req, SendMessage) and "Your first 14 days are free, then £2.99/month" in req.text
     assert req.reply_markup.inline_keyboard[0][0].callback_data == "trial:start"
 
 
@@ -96,6 +97,43 @@ async def test_admin_commands_silent_for_others(wiring):
     assert await feed(message(999, "/stats")) == []
     [req] = await feed(message(OWNER, "/stats"))
     assert "Users:" in req.text
+
+
+@pytest.mark.parametrize("command", ["/pause", "/resume", "/confirmsweep"])
+async def test_maintenance_commands_silent_for_others(wiring, tg, command):
+    svc, feed = wiring
+    await add_user(svc.db, 999)
+    if command == "/resume":
+        await set_paused(svc.db, NOW, by=OWNER)
+    before = await svc.db.fetchall("SELECT key, value FROM kv ORDER BY key")
+    assert await feed(message(999, command)) == []
+    assert await svc.db.fetchall("SELECT key, value FROM kv ORDER BY key") == before
+    assert tg.events == []
+
+
+async def test_pause_resume_and_confirmsweep_routed_for_the_owner(wiring):
+    svc, feed = wiring
+    # Private chats only: the owner's /pause in a group does nothing.
+    assert await feed(message(OWNER, "/pause", chat_type="group", chat_id=-100555)) == []
+    assert await paused_since(svc.db) is None
+
+    # The session records every request of the test, so the newest reply is last.
+    [req] = await feed(message(OWNER, "/pause"))
+    assert isinstance(req, SendMessage) and req.text.startswith("⏸ Paused")
+    assert await paused_since(svc.db) is not None
+    assert (await feed(message(OWNER, "/confirmsweep")))[-1].text.startswith("Paused: /resume first")
+    assert (await feed(message(OWNER, "/resume")))[-1].text.startswith("▶️ Resumed")
+    assert await paused_since(svc.db) is None
+    last = (await feed(message(OWNER, "/confirmsweep")))[-1]
+    assert last.text.startswith("Nothing is waiting for /confirmsweep")
+
+
+async def test_help_shows_admin_commands_to_admins_only(wiring):
+    svc, feed = wiring
+    [req] = await feed(message(999, "/help"))
+    assert req.text == texts.HELP
+    requests = await feed(message(OWNER, "/help"))
+    assert len(requests) == 2 and requests[-1].text == texts.HELP + "\n\n" + texts.HELP_ADMIN
 
 
 async def test_buttons_always_answered(wiring):
@@ -129,7 +167,8 @@ async def test_how_it_works_depends_on_trial_eligibility(wiring):
     assert isinstance(requests[0], AnswerCallbackQuery)
     assert requests[-1].text == texts.HOW_IT_WORKS_SUBSCRIBE.format(price=PRICE)
     await add_user(svc.db, 6)
-    assert (await feed(callback(6, "how")))[-1].text == texts.HOW_IT_WORKS_TRIAL.format(price=PRICE)
+    trial_text = (await feed(callback(6, "how")))[-1].text
+    assert "14 days free" in trial_text and "A card is required" in trial_text and "/manage" in trial_text
 
 
 async def test_any_private_message_or_button_clears_blocked_bot(wiring):

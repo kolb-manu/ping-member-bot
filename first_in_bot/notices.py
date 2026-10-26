@@ -16,6 +16,7 @@ from aiogram.types import InlineKeyboardMarkup
 
 from . import texts
 from .keyboards import manage_keyboard
+from .maintenance import paused_since
 from .models import User
 from .services import Services
 from .telegram_gateway import SendResult
@@ -23,7 +24,11 @@ from .timeutil import format_local, to_iso
 
 log = logging.getLogger(__name__)
 
-TRIAL_REMINDER_LEAD = timedelta(days=2)
+# The last-chance reminder goes out about this long before the first charge. The
+# earlier one (TRIAL_REMINDER_DAYS_BEFORE) stops being due once this window starts.
+TRIAL_FINAL_LEAD = timedelta(hours=3)
+KIND_REMINDER = "trial_reminder"
+KIND_FINAL = "trial_final"
 
 
 class NoticeOutcome(enum.Enum):
@@ -84,40 +89,69 @@ async def _forget(svc: Services, telegram_id: int, kind: str, cycle_key: str) ->
         )
 
 
-def trial_reminder_due(user: User, now: datetime) -> bool:
-    """2 days before a Stripe trial converts. Only while it's still relevant: still
-    trialing, not cancelled, and the trial hasn't ended yet (e.g. after downtime)."""
-    end = user.sub_trial_end
+def _reminder_candidate(user: User) -> bool:
+    """Reminders are only for people who are still on a running, uncancelled Stripe trial."""
     return (
         user.sub_status == "trialing"
-        and end is not None
+        and user.sub_trial_end is not None
         and not user.cancel_at_period_end
         and not user.blocked_bot
         and not user.banned
-        and end - TRIAL_REMINDER_LEAD <= now < end
     )
 
 
+def trial_reminder_due(user: User, now: datetime, days_before: int) -> bool:
+    """The reminder days_before days ahead of the first charge. Only while it's still
+    relevant: not cancelled, the trial hasn't ended, and the last-day window hasn't
+    started (after downtime the final reminder replaces this one)."""
+    if not _reminder_candidate(user):
+        return False
+    end = user.sub_trial_end
+    assert end is not None
+    return end - timedelta(days=days_before) <= now < end - TRIAL_FINAL_LEAD
+
+
+def trial_final_due(user: User, now: datetime) -> bool:
+    """The last-day reminder, about 3 hours before the first charge."""
+    if not _reminder_candidate(user):
+        return False
+    end = user.sub_trial_end
+    assert end is not None
+    return end - TRIAL_FINAL_LEAD <= now < end
+
+
 async def send_notices(svc: Services, now: datetime) -> int:
-    """Scheduler job. Returns how many notices went out."""
+    """Scheduler job. Returns how many notices went out. Each kind is sent at most
+    once per trial (the cycle key is the trial end), and never to someone who has
+    cancelled.
+
+    While paused (/pause) it sends and records nothing. After /resume the due rules
+    above decide, as after downtime: a reminder whose window has passed (the trial
+    ended, or the last-day window began) is never sent late."""
+    since = await paused_since(svc.db)
+    if since is not None:
+        log.info("Notices: paused since %s, sending nothing", to_iso(since))
+        return 0
     rows = await svc.db.fetchall(
         "SELECT * FROM users WHERE sub_status='trialing' AND sub_trial_end IS NOT NULL "
         "AND cancel_at_period_end=0 AND blocked_bot=0 AND banned=0"
     )
+    days_before = svc.config.trial_reminder_days_before
+    price = texts.price_text(svc.price_label)
     sent = 0
     for row in rows:
         user = User.from_row(row)
-        if not trial_reminder_due(user, now):
-            continue
         assert user.sub_trial_end is not None
-        text = texts.TRIAL_REMINDER_2D.format(
-            end_date=format_local(user.sub_trial_end, svc.config.timezone),
-            price=texts.price_text(svc.price_label),
-        )
+        end_date = format_local(user.sub_trial_end, svc.config.timezone)
+        if trial_reminder_due(user, now, days_before):
+            kind, template = KIND_REMINDER, texts.TRIAL_REMINDER
+        elif trial_final_due(user, now):
+            kind, template = KIND_FINAL, texts.TRIAL_FINAL
+        else:
+            continue
         outcome = await deliver_notice(
-            svc, user, "trial_2d", to_iso(user.sub_trial_end), text, manage_keyboard(), now
+            svc, user, kind, to_iso(user.sub_trial_end),
+            template.format(end_date=end_date, price=price), manage_keyboard(), now,
         )
         sent += outcome is NoticeOutcome.SENT
-    # TODO: the spec's "last day" reminder (3.3 step 6) isn't built; ask the owner if
-    # it's still wanted now that the trial converts automatically via Stripe.
     return sent

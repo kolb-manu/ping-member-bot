@@ -153,11 +153,49 @@ async def _m003_past_due_anchor(conn: aiosqlite.Connection) -> None:
         await conn.execute(stmt)
 
 
+async def _m004_disputes(conn: aiosqlite.Connection) -> None:
+    # Payment disputes seen at Stripe. One row per dispute, so a dispute is only ever
+    # alerted once and its later status changes (won/lost) can be followed.
+    await conn.execute(
+        """CREATE TABLE disputes(
+            id          TEXT PRIMARY KEY,
+            telegram_id INTEGER,
+            customer_id TEXT,
+            charge_id   TEXT,
+            status      TEXT NOT NULL,
+            created_at  TEXT,
+            seen_at     TEXT NOT NULL,
+            alerted     INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
+
+
+async def _m005_checkout_trial_end(conn: aiosqlite.Connection) -> None:
+    # The fixed trial_end a checkout was created with, so a reused session shows
+    # (and charges on) the same date. NULL for sessions made before this.
+    await conn.execute("ALTER TABLE checkout_sessions ADD COLUMN trial_end TEXT")
+
+
+async def _m006_trial_reminder_kind(conn: aiosqlite.Connection) -> None:
+    # The trial reminder used to be recorded as kind 'trial_2d'; it is now
+    # 'trial_reminder', sent in a wider window. Record it under the new name too,
+    # with the same cycle_key (the trial end), so nobody who had it gets it again.
+    # The kinds are written out here, not imported: a migration must not change
+    # when the code does.
+    await conn.execute(
+        "INSERT OR IGNORE INTO notices_sent(telegram_id, kind, cycle_key, sent_at) "
+        "SELECT telegram_id, 'trial_reminder', cycle_key, sent_at FROM notices_sent WHERE kind='trial_2d'"
+    )
+
+
 # Append new migrations to the end; never edit or reorder old ones.
 MIGRATIONS: list[Callable[[aiosqlite.Connection], Awaitable[None]]] = [
     _m001_initial,
     _m002_stripe_trial,
     _m003_past_due_anchor,
+    _m004_disputes,
+    _m005_checkout_trial_end,
+    _m006_trial_reminder_kind,
 ]
 
 

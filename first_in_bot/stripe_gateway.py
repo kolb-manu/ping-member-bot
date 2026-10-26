@@ -6,6 +6,8 @@ back as small frozen dataclasses. Each call is logged by name at INFO; the API
 key is never logged. The restricted key only allows: Checkout Sessions write,
 Customers write, Subscriptions read, Customer Portal write, Disputes read and
 reading prices, so don't add calls to other endpoints (no customers.search).
+list_disputes expands each dispute's charge to learn the customer, which
+needs Charges read on the key.
 """
 from __future__ import annotations
 
@@ -21,6 +23,12 @@ import stripe
 log = logging.getLogger(__name__)
 
 STRIPE_API_VERSION = "2026-09-30.endive"
+# Every call runs in a worker thread that a shutdown can't cancel, and the process
+# only exits once that thread is done. stripe-python's default of 80 s a request
+# would outlast systemd's 45 s stop timeout, so: 12 s a request and 2 retries, about
+# 38 s at worst with Stripe's pauses between tries (and well under a second normally).
+STRIPE_TIMEOUT = 12.0
+STRIPE_RETRIES = 2
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
 _KEY_RE = re.compile(r"\b(sk|rk|pk)_(test|live)_\S+")
 _CURRENCY_SYMBOLS = {"gbp": "£", "eur": "€", "usd": "$"}
@@ -42,6 +50,10 @@ class CustomerMissing(StripeGatewayError):
 
 class SubscriptionMissing(StripeGatewayError):
     """The subscription no longer exists at Stripe."""
+
+
+class CheckoutMissing(StripeGatewayError):
+    """Stripe has no such checkout session (e.g. test data was deleted)."""
 
 
 def _resource_missing(exc: BaseException | None, param: str | None = None) -> bool:
@@ -77,6 +89,15 @@ class CheckoutInfo:
     expires_at: datetime
     subscription_id: str | None
     subscription: SubInfo | None     # set when the subscription was expanded
+
+
+@dataclass(frozen=True)
+class DisputeInfo:
+    id: str
+    status: str                      # needs_response / under_review / won / lost / warning_*
+    charge_id: str | None
+    customer_id: str | None          # None if the charge wasn't expanded or has no customer
+    created: datetime | None
 
 
 # --- Parsing (pure, tested on plain dict payloads) ------------------------------
@@ -141,6 +162,19 @@ def parse_checkout(obj: Any) -> CheckoutInfo:
     )
 
 
+def parse_dispute(obj: Any) -> DisputeInfo:
+    d = _plain(obj)
+    charge = d.get("charge")
+    customer = _id_of(charge.get("customer")) if isinstance(charge, dict) else None
+    return DisputeInfo(
+        id=d["id"],
+        status=d.get("status") or "",
+        charge_id=_id_of(charge),
+        customer_id=customer,
+        created=_ts(d.get("created")),
+    )
+
+
 def format_price(obj: Any) -> str | None:
     """'£2.99/month'. None if the price has no fixed amount."""
     d = _plain(obj)
@@ -164,12 +198,20 @@ def _redact(text: str) -> str:
 
 # --- Gateway ----------------------------------------------------------------------
 
+def make_client(api_key: str) -> Any:
+    """The Stripe client the bot uses, also used by the preflight check."""
+    return stripe.StripeClient(
+        api_key,
+        stripe_version=STRIPE_API_VERSION,
+        max_network_retries=STRIPE_RETRIES,
+        http_client=stripe.RequestsClient(timeout=STRIPE_TIMEOUT),
+    )
+
+
 class StripeGateway:
     def __init__(self, api_key: str, *, client: Any | None = None):
         # client is for tests; normally we build the real one here.
-        self._client = client or stripe.StripeClient(
-            api_key, stripe_version=STRIPE_API_VERSION, max_network_retries=3
-        )
+        self._client = client or make_client(api_key)
 
     async def _call(self, name: str, fn: Callable[[], T]) -> T:
         log.info("Stripe call: %s", name)
@@ -207,14 +249,16 @@ class StripeGateway:
         customer_id: str,
         telegram_id: int,
         price_id: str,
-        trial_days: int | None,
+        trial_end: datetime | None,
         success_url: str,
         cancel_url: str,
         idempotency_key: str,
     ) -> CheckoutInfo:
         subscription_data: dict[str, Any] = {"metadata": {"telegram_id": str(telegram_id)}}
-        if trial_days:
-            subscription_data["trial_period_days"] = trial_days
+        if trial_end is not None:
+            # A fixed end, not trial_period_days: the first-charge date shown to the
+            # buyer is then the date Stripe charges, even if they finish checkout later.
+            subscription_data["trial_end"] = int(trial_end.timestamp())
         params: dict[str, Any] = {
             # No ui_mode: the default is the Stripe-hosted page (the values were renamed in 2026).
             "mode": "subscription",
@@ -235,10 +279,16 @@ class StripeGateway:
         return parse_checkout(session)
 
     async def get_checkout(self, session_id: str) -> CheckoutInfo:
-        session = await self._call(
-            "checkout.sessions.retrieve",
-            lambda: self._client.v1.checkout.sessions.retrieve(session_id, {"expand": ["subscription"]}),
-        )
+        """Raises CheckoutMissing if Stripe has no such session."""
+        try:
+            session = await self._call(
+                "checkout.sessions.retrieve",
+                lambda: self._client.v1.checkout.sessions.retrieve(session_id, {"expand": ["subscription"]}),
+            )
+        except StripeGatewayError as exc:
+            if _resource_missing(exc.__cause__):
+                raise CheckoutMissing(f"Stripe has no checkout session {session_id}") from exc.__cause__
+            raise
         return parse_checkout(session)
 
     async def list_subscriptions(self) -> list[SubInfo]:
@@ -259,6 +309,14 @@ class StripeGateway:
                 raise SubscriptionMissing(f"Stripe has no subscription {sub_id}") from exc.__cause__
             raise
         return parse_subscription(sub)
+
+    async def list_disputes(self) -> list[DisputeInfo]:
+        """Every dispute, with its charge expanded so the customer is known."""
+        def fetch_all() -> list[DisputeInfo]:
+            page = self._client.v1.disputes.list({"limit": 100, "expand": ["data.charge"]})
+            return [parse_dispute(d) for d in page.auto_paging_iter()]
+
+        return await self._call("disputes.list", fetch_all)
 
     async def portal_url(self, customer_id: str, return_url: str) -> str:
         try:

@@ -61,9 +61,9 @@ def buttons(markup):
 # --- welcome --------------------------------------------------------------------
 
 def test_welcome_offers_trial_with_price_and_card_wording():
-    text = welcome_text(User(telegram_id=1), PRICE)
-    assert "Your first 2 weeks are free, then £2.99/month" in text
-    assert "won't pay" in text and "No card needed" not in text
+    text = welcome_text(User(telegram_id=1), PRICE, load_config(GOOD))
+    assert "Your first 14 days are free, then £2.99/month" in text
+    assert "A card is required" in text and "/manage" in text and "No card needed" not in text
 
 
 def test_welcome_for_returning_user_offers_subscription():
@@ -79,6 +79,26 @@ def test_welcome_keyboard_trial_button_is_checkout():
     assert first.text == "Start my free 2 weeks" and first.callback_data == "trial:start"
 
 
+@pytest.mark.parametrize("days,label", [(14, "Start my free 2 weeks"), (3, "Start my free 3 days"),
+                                        (21, "Start my free 21 days")])
+def test_trial_button_and_how_it_works_follow_trial_days(days, label):
+    from first_in_bot.keyboards import checkout_button, subscribe_keyboard
+
+    assert checkout_button(User(telegram_id=1), trial_days=days).text == label
+    assert buttons(subscribe_keyboard(User(telegram_id=1), days))[0].text == label
+    assert f"1. Tap <b>{label}</b> and add your card" in texts.how_it_works_trial("terms", 3, days)
+    status = texts.STATUS_NONE_TRIAL_TEMPLATE.format(trial_length=texts.trial_length(days))
+    assert status.endswith(f"to start your free {label.removeprefix('Start my free ')}.")
+
+
+def test_the_owners_14_day_wording_is_unchanged():
+    assert texts.trial_label(14) == "Start my free 2 weeks"
+    assert texts.HOW_IT_WORKS_TRIAL.format(terms="T", reminder_days=3) == texts.how_it_works_trial("T", 3, 14)
+    assert "1. Tap <b>Start my free 2 weeks</b> and add your card" in texts.HOW_IT_WORKS_TRIAL
+    assert texts.STATUS_NONE_TRIAL == ("You haven't started your free trial yet. "
+                                       "Tap /subscribe to start your free 2 weeks.")
+
+
 @pytest.mark.parametrize("user,trial", [
     (None, True),
     (User(telegram_id=1), True),
@@ -86,9 +106,11 @@ def test_welcome_keyboard_trial_button_is_checkout():
     (User(telegram_id=1, trial_started_at=NOW - 40 * D), False),
 ])
 def test_how_it_works_only_promises_a_trial_to_the_eligible(user, trial):
-    text = how_it_works_text(user, PRICE)
-    assert ("first 2 weeks" in text) is trial
+    text = how_it_works_text(user, PRICE, load_config(GOOD), NOW)
+    assert ("14 days free" in text) is trial
     assert ("Tap <b>Subscribe</b> and pay £2.99/month" in text) is not trial
+    if trial:
+        assert "A card is required" in text and "15 Nov 2026" in text and "/manage" in text
 
 
 def test_copy_never_says_no_card_or_reselling():
@@ -102,7 +124,7 @@ def test_copy_never_says_no_card_or_reselling():
 def test_brand_name_never_ping_in_code():
     root = Path(__file__).resolve().parent.parent / "first_in_bot"
     for path in root.rglob("*.py"):
-        assert not re.search(r"\bPing\b", path.read_text()), path
+        assert not re.search(r"\bPing\b", path.read_text(encoding="utf-8")), path
 
 
 # --- checkout buttons ----------------------------------------------------------
@@ -122,11 +144,16 @@ async def test_trial_button_sends_checkout_link(svc, tg, stripe_fake):
     await billing_handlers.on_checkout_button(cb, svc)
     assert cb.answers == [("Opening checkout…", False)]   # answered before Stripe is called
     [text] = tg.sent_to(1)
-    assert "start your free 2 weeks" in text and "£2.99/month is charged automatically" in text
+    # Everything the buyer must know before the Stripe link.
+    assert "14 days free" in text and "£2.99/month" in text
+    assert "A card is required" in text
+    assert "first payment is taken on <b>15 Nov 2026</b>" in text
+    assert "fixed when this link is made" in text
+    assert "Cancel any time before then with /manage" in text
     url_button, done_button = buttons(tg.markups_to(1)[0])
     assert url_button.url == "https://checkout.stripe.test/cs_1"
     assert done_button.callback_data == "paid:check" and done_button.text == "I've added my card"
-    assert stripe_fake.created[0]["trial_days"] == 14
+    assert stripe_fake.created[0]["trial_end"] == NOW + 14 * D
 
 
 async def test_old_trial_button_after_trial_used(svc, tg, stripe_fake):
@@ -134,7 +161,7 @@ async def test_old_trial_button_after_trial_used(svc, tg, stripe_fake):
     await billing_handlers.on_checkout_button(FakeCallback(1, "trial:start"), svc)
     text = tg.sent_to(1)[0]
     assert text.startswith(texts.ALREADY_HAD_TRIAL) and "subscribe for £2.99/month" in text
-    assert stripe_fake.created[0]["trial_days"] is None
+    assert stripe_fake.created[0]["trial_end"] is None
     assert buttons(tg.markups_to(1)[0])[1].text == "I've paid"
 
 
@@ -307,6 +334,28 @@ async def test_terms_mentions_not_affiliated_and_price(svc):
     assert "£2.99/month" in msg.answers[0][0]
 
 
+async def test_help_for_everyone_else_is_unchanged(svc):
+    for uid in (1, 999):
+        msg = FakeMessage(uid)
+        await billing_handlers.cmd_help(msg, svc)
+        assert msg.answers == [(texts.HELP, None)]
+
+
+ADMIN_COMMANDS = ["/stats", "/report", "/user", "/grant", "/revoke", "/ban", "/unban", "/dryrun", "/confirmsweep",
+                  "/pause", "/resume"]
+
+
+@pytest.mark.parametrize("uid", [OWNER, 222])   # every ADMIN_IDS entry, not just the owner
+async def test_help_for_admins_adds_the_admin_commands(svc, uid):
+    msg = FakeMessage(uid)
+    await billing_handlers.cmd_help(msg, svc)
+    [(text, _)] = msg.answers
+    assert text == texts.HELP + "\n\n" + texts.HELP_ADMIN
+    admin_lines = texts.HELP_ADMIN.split("\n")[1:]
+    assert [line.split(":")[0].split()[0] for line in admin_lines] == ADMIN_COMMANDS   # one line each
+    assert "<id" not in texts.HELP_ADMIN          # angle brackets escaped for HTML parse mode
+
+
 # --- admin -------------------------------------------------------------------------
 
 async def test_admin_commands_ignored_for_non_admins(svc, tg):
@@ -314,14 +363,19 @@ async def test_admin_commands_ignored_for_non_admins(svc, tg):
     stranger = 999
     for handler, args in [
         (admin_handlers.cmd_stats, ()),
+        (admin_handlers.cmd_report, ()),
         (admin_handlers.cmd_user, (cmd("user", "5"),)),
         (admin_handlers.cmd_grant, (cmd("grant", "5 30"),)),
         (admin_handlers.cmd_dryrun, ()),
+        (admin_handlers.cmd_confirmsweep, ()),
+        (admin_handlers.cmd_pause, ()),
+        (admin_handlers.cmd_resume, ()),
     ]:
         msg = FakeMessage(stranger)
         await handler(msg, *args, svc)
         assert msg.answers == []
     assert (await get_user(svc.db, 5)).manual_grant_until is None
+    assert await svc.db.kv_get("maintenance_paused_since") is None
     assert tg.events == []
 
 
@@ -378,3 +432,87 @@ async def test_dryrun_command_reports_regardless_of_fingerprint(svc, tg):
         await admin_handlers.cmd_dryrun(msg, svc)
         assert "Would remove (1): 5 @user5" in msg.answers[0][0]
     assert tg.calls("kick") == [] and tg.sent_to(5) == []
+
+
+async def test_terms_state_the_trial_facts_with_the_first_charge_date(svc, tg):
+    msg = FakeMessage(1)
+    await billing_handlers.cmd_terms(msg, svc)
+    [(text, _)] = msg.answers
+    assert "14 days free" in text and "£2.99/month" in text and "A card is required" in text
+    assert "first payment is taken on <b>15 Nov 2026</b>" in text
+    assert "3 days before your first payment" in text and "/manage" in text
+    assert "not affiliated with FIXR" in text
+
+
+async def test_cancelled_trial_status_says_access_until_trial_end(svc):
+    await add_user(svc.db, 1, stripe_sub_id="sub_1", sub_status="canceled", sub_trial_end=NOW + 3 * D)
+    reply = await billing_handlers.status_reply(svc, 1, NOW)
+    assert "You've cancelled" in reply.text and "won't be charged" in reply.text
+    assert texts.STATUS_ACCESS_YES in reply.text
+
+
+async def test_resent_link_shows_the_original_first_charge_date(svc, tg, stripe_fake):
+    """Same session reused 20 hours later: the message must still show the date Stripe will charge."""
+    await add_user(svc.db, 1)
+    first = await billing_handlers.checkout_reply(svc, 1, NOW)
+    second = await billing_handlers.checkout_reply(svc, 1, NOW + timedelta(hours=20))
+    assert "<b>15 Nov 2026</b>" in first.text and "<b>15 Nov 2026</b>" in second.text
+    assert "16 Nov 2026" not in second.text
+    assert first.markup.inline_keyboard[0][0].url == second.markup.inline_keyboard[0][0].url
+    assert len(stripe_fake.created) == 1
+
+
+# --- the price read later, and "How it works" from an old message ---------------------------
+
+async def test_no_stripe_link_while_the_price_is_unknown(svc, tg, stripe_fake):
+    from first_in_bot.handlers.start import on_start
+
+    await add_user(svc.db, 1)
+    svc.price.label = None   # Stripe couldn't be read at startup
+    for data in ("trial:start", "subscribe"):
+        cb = FakeCallback(1, data)
+        await billing_handlers.on_checkout_button(cb, svc)
+        assert cb.answers == [("Opening checkout…", False)]
+    msg = FakeMessage(1)
+    await billing_handlers.cmd_subscribe(msg, svc)
+    assert tg.sent_to(1) == [billing_handlers.PRICE_UNKNOWN] * 2 and tg.markups_to(1) == [None, None]
+    assert msg.answers == [(billing_handlers.PRICE_UNKNOWN, None)]
+    assert stripe_fake.created == []
+
+    # Read later (billing.refresh_price): every handler sees it at once, no restart.
+    svc.price.label = "£3.49/month"
+    await billing_handlers.on_checkout_button(FakeCallback(1, "trial:start"), svc)
+    assert "then <b>£3.49/month</b>" in tg.sent_to(1)[-1]
+    start = FakeMessage(1)
+    await on_start(start, cmd("start"), svc)
+    assert "then £3.49/month" in start.answers[0][0]
+
+
+async def test_how_it_works_answers_even_from_an_old_or_deleted_message(svc, tg):
+    from aiogram.types import Chat, InaccessibleMessage
+
+    from first_in_bot.handlers.start import on_how
+
+    await add_user(svc.db, 1)
+    # Days old, after a restart: the welcome is inaccessible and the press too old to answer.
+    cb = FakeCallback(1, "how", too_old=True)
+    cb.message = InaccessibleMessage(chat=Chat(id=1, type="private"), message_id=5)
+    await on_how(cb, svc)
+    [text] = tg.sent_to(1)
+    assert "14 days free" in text and "£2.99/month" in text and "A card is required" in text
+
+
+# --- trial length follows TRIAL_DAYS everywhere ------------------------------------------
+
+def test_trial_wording_follows_trial_days_on_every_screen():
+    short = load_config({**GOOD, "TRIAL_DAYS": "3"})
+    user = User(telegram_id=1)
+    [button] = welcome_keyboard(user, short).inline_keyboard[0]
+    assert button.text == "Start my free 3 days"
+    how = how_it_works_text(user, PRICE, short, NOW)
+    assert "Start my free 3 days" in how and "2 weeks" not in how
+    status = status_text(user, NOW, short, PRICE)
+    assert "start your free 3 days" in status and "2 weeks" not in status
+    # The owner's wording for the standard 14 days is unchanged.
+    [button] = welcome_keyboard(user, load_config(GOOD)).inline_keyboard[0]
+    assert button.text == "Start my free 2 weeks"

@@ -76,6 +76,13 @@ async def test_not_entitled_declined_with_trial_button(svc, tg):
     assert not (await get_user(svc.db, 1)).in_paid_channel
 
 
+async def test_trial_button_follows_trial_days(db, tg, stripe_fake):
+    svc = make_svc(db, tg, stripe_fake, TRIAL_DAYS="3")
+    await add_user(db, 1)
+    await handle_join_request(svc, 1, CHAT, NOW)
+    assert tg.markups_to(CHAT)[0].inline_keyboard[0][0].text == "Start my free 3 days"
+
+
 async def test_not_entitled_after_trial_gets_subscribe_button(svc, tg):
     await add_user(svc.db, 1, stripe_sub_id="sub_1", sub_status="canceled", trial_started_at=NOW - timedelta(days=40))
     await handle_join_request(svc, 1, CHAT, NOW)

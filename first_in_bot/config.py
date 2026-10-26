@@ -27,6 +27,7 @@ class Config:
     paid_join_request_link: str
     free_channel_link: str
     trial_days: int
+    trial_reminder_days_before: int
     past_due_grace: timedelta
     removals_enabled: bool
     max_removals_per_sweep: int
@@ -37,6 +38,8 @@ class Config:
     timezone: ZoneInfo
     support_contact: str
     db_path: str
+    backup_dir: str
+    backup_keep: int
 
     @property
     def stripe_mode(self) -> str:
@@ -117,9 +120,13 @@ def load_config(env: Mapping[str, str]) -> Config:
     if free_link and not _TME_RE.match(free_link):
         problems.append("FREE_CHANNEL_LINK must start with https://t.me/")
 
-    trial_days = integer("TRIAL_DAYS", 14, 1)
+    # Checkout only accepts a fixed trial_end at least 48 hours ahead, so 3 days is the floor.
+    trial_days = integer("TRIAL_DAYS", 14, 3)
+    reminder_days = integer("TRIAL_REMINDER_DAYS_BEFORE", 3, 1)
     grace_hours = integer("PAST_DUE_GRACE_HOURS", 72, 0)
     max_removals = integer("MAX_REMOVALS_PER_SWEEP", 5, 1)
+    # At least one, so pruning can never delete the backup it has just made.
+    backup_keep = integer("BACKUP_KEEP", 14, 1)
 
     removals_raw = get("REMOVALS_ENABLED", "false").lower()
     if removals_raw in _TRUE:
@@ -162,6 +169,7 @@ def load_config(env: Mapping[str, str]) -> Config:
         paid_join_request_link=paid_link,
         free_channel_link=free_link,
         trial_days=trial_days,
+        trial_reminder_days_before=reminder_days,
         past_due_grace=timedelta(hours=grace_hours),
         removals_enabled=removals_enabled,
         max_removals_per_sweep=max_removals,
@@ -172,4 +180,6 @@ def load_config(env: Mapping[str, str]) -> Config:
         timezone=tz,
         support_contact=get("SUPPORT_CONTACT"),
         db_path=get("DB_PATH", "data/first-in.db"),
+        backup_dir=get("BACKUP_DIR", "backups"),
+        backup_keep=backup_keep,
     )

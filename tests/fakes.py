@@ -9,7 +9,14 @@ from first_in_bot.config import Config, load_config
 from first_in_bot.db import Database
 from first_in_bot.models import User
 from first_in_bot.services import Services
-from first_in_bot.stripe_gateway import CheckoutInfo, CustomerMissing, StripeGatewayError, SubInfo, SubscriptionMissing
+from first_in_bot.stripe_gateway import (
+    CheckoutInfo,
+    CustomerMissing,
+    DisputeInfo,
+    StripeGatewayError,
+    SubInfo,
+    SubscriptionMissing,
+)
 from first_in_bot.telegram_gateway import SendResult
 from first_in_bot.timeutil import to_iso
 from first_in_bot.users import get_user, register_user
@@ -29,6 +36,8 @@ class FakeTelegram:
         self.approve_ok = True
         self.decline_ok = True
         self.kick_ok = True
+        self.unban_ok = True
+        self.permanent_kicks: list[int] = []
         # user_id -> user_chat_id for join requesters who never started the bot:
         # Telegram only lets us DM that chat until their request is processed.
         self.window_chats: dict[int, int] = {}
@@ -67,9 +76,15 @@ class FakeTelegram:
         self.events.append(("status", user_id))
         return self.statuses.get(user_id, self.default_status)
 
-    async def kick(self, user_id: int) -> bool:
+    async def kick(self, user_id: int, permanent: bool = False) -> bool:
         self.events.append(("kick", user_id))
+        if permanent:
+            self.permanent_kicks.append(user_id)
         return self.kick_ok
+
+    async def unban(self, user_id: int) -> bool:
+        self.events.append(("unban", user_id))
+        return self.unban_ok
 
 
 class FakeStripe:
@@ -89,6 +104,8 @@ class FakeStripe:
         self.retrievable: dict[str, SubInfo] = {}   # subscriptions.retrieve; anything else is missing
         self.fail_retrieve = False
         self.retrieved: list[str] = []
+        self.disputes: list[DisputeInfo] = []
+        self.fail_disputes = False
         self.on_list = None                          # async hook run while the listing is "in flight"
         self._n = 0
 
@@ -136,6 +153,11 @@ class FakeStripe:
         if self.on_list is not None:
             await self.on_list()   # e.g. a checkout poll landing mid-listing
         return snapshot
+
+    async def list_disputes(self) -> list[DisputeInfo]:
+        if self.fail_disputes:
+            raise StripeGatewayError("Stripe disputes.list failed: APIConnectionError")
+        return list(self.disputes)
 
     async def get_subscription(self, sub_id: str) -> SubInfo:
         self.retrieved.append(sub_id)

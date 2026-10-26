@@ -1,13 +1,16 @@
 """Stripe payload parsing and the exact parameters the gateway sends. A fake
 client stands in for stripe.StripeClient, so nothing touches the network."""
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 import stripe
 
 from first_in_bot.stripe_gateway import (
+    STRIPE_RETRIES,
+    STRIPE_TIMEOUT,
+    CheckoutMissing,
     CustomerMissing,
     PortalNotConfigured,
     StripeGateway,
@@ -187,21 +190,24 @@ def fake_client():
     ))
 
 
-async def create(gw, trial_days):
+TRIAL_END = datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc)
+
+
+async def create(gw, trial_end):
     return await gw.create_checkout(customer_id="cus_ABC", telegram_id=42, price_id="price_123",
-                                    trial_days=trial_days, success_url="https://t.me/Bot",
+                                    trial_end=trial_end, success_url="https://t.me/Bot",
                                     cancel_url="https://t.me/Bot", idempotency_key="checkout-42-t-1")
 
 
 async def test_checkout_params_with_trial():
     client = fake_client()
     gw = StripeGateway("rk_test_x", client=client)
-    info = await create(gw, 14)
+    info = await create(gw, TRIAL_END)
     params, options = client.v1.checkout.sessions.create.calls[0]
     assert params["mode"] == "subscription"
     assert params["customer"] == "cus_ABC" and params["client_reference_id"] == "42"
     assert params["line_items"] == [{"price": "price_123", "quantity": 1}]
-    assert params["subscription_data"] == {"metadata": {"telegram_id": "42"}, "trial_period_days": 14}
+    assert params["subscription_data"] == {"metadata": {"telegram_id": "42"}, "trial_end": int(TRIAL_END.timestamp())}
     assert params["payment_method_collection"] == "always"
     assert params["allow_promotion_codes"] is True
     assert params["success_url"] == params["cancel_url"] == "https://t.me/Bot"
@@ -215,6 +221,7 @@ async def test_checkout_params_without_trial():
     await create(StripeGateway("rk_test_x", client=client), None)
     params, _ = client.v1.checkout.sessions.create.calls[0]
     assert "trial_period_days" not in params["subscription_data"]
+    assert "trial_end" not in params["subscription_data"]
     assert params["payment_method_collection"] == "always"
 
 
@@ -274,14 +281,14 @@ async def test_deleted_customer_is_its_own_error():
     client.v1.checkout.sessions.create.error = no_such("customer")
     gw = StripeGateway("rk_test_x", client=client)
     with pytest.raises(CustomerMissing):
-        await create(gw, 14)
+        await create(gw, TRIAL_END)
     client.v1.billing_portal.sessions.create.error = no_such("customer")
     with pytest.raises(CustomerMissing):
         await gw.portal_url("cus_ABC", "https://t.me/Bot")
     # Some other missing thing (e.g. the price) is an ordinary error.
     client.v1.checkout.sessions.create.error = no_such("line_items[0][price]", "price: 'price_123'")
     with pytest.raises(StripeGatewayError) as exc:
-        await create(gw, 14)
+        await create(gw, TRIAL_END)
     assert not isinstance(exc.value, CustomerMissing)
 
 
@@ -295,3 +302,30 @@ async def test_get_subscription_missing_vs_other_errors():
     with pytest.raises(StripeGatewayError) as exc:
         await gw.get_subscription("sub_tc")
     assert not isinstance(exc.value, SubscriptionMissing)
+
+
+async def test_get_checkout_missing_vs_other_errors():
+    client = fake_client()
+    gw = StripeGateway("rk_test_x", client=client)
+    client.v1.checkout.sessions.retrieve.error = no_such("session", "checkout.session: 'cs_gone'")
+    with pytest.raises(CheckoutMissing):
+        await gw.get_checkout("cs_gone")
+    client.v1.checkout.sessions.retrieve.error = stripe.APIConnectionError("network down")
+    with pytest.raises(StripeGatewayError) as exc:
+        await gw.get_checkout("cs_1")
+    assert not isinstance(exc.value, CheckoutMissing)
+
+
+def test_real_client_has_a_bounded_timeout_and_keeps_the_api_version():
+    """A Stripe call runs in a thread that shutdown can't cancel, so one call with
+    all its retries must fit inside systemd's 45 s stop timeout."""
+    gw = StripeGateway("rk_test_" + "x" * 20)
+    requestor = gw._client._requestor
+    http = requestor._client
+    assert isinstance(http, stripe.RequestsClient) and http._timeout == STRIPE_TIMEOUT
+    assert requestor._options.max_network_retries == STRIPE_RETRIES
+    assert requestor._options.stripe_version == "2026-09-30.endive"
+    # Every try timing out, plus stripe-python's pauses between tries (0.5 s, doubling).
+    pauses = sum(min(stripe.HTTPClient.INITIAL_DELAY * 2 ** n, stripe.HTTPClient.MAX_DELAY)
+                 for n in range(STRIPE_RETRIES))
+    assert (STRIPE_RETRIES + 1) * STRIPE_TIMEOUT + pauses < 40
