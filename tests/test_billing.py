@@ -1,4 +1,5 @@
 """Checkout, payment polling, applying subscriptions and the full sync."""
+import dataclasses
 from datetime import timedelta
 
 import pytest
@@ -361,6 +362,28 @@ async def test_sync_unmatched_subscriptions_dont_fail_the_sync(svc, stripe_fake)
     result = await sync_subscriptions(svc, NOW)
     assert result.ok and result.unmatched == 1
     assert await svc.db.kv_get(LAST_FULL_SYNC_KEY) == to_iso(NOW)
+
+
+async def test_sync_leaves_a_payment_link_subscription_alone(svc, stripe_fake, tg):
+    # A Stripe Payment Link (the personal-alerts design, desk check D3) makes its own
+    # customer and puts no telegram_id on anything: the bot can't tie it to anyone,
+    # so it must change nobody, DM nobody and not fail the sync.
+    await add_user(svc.db, 1)
+    await apply_subscription(svc.db, trial_sub(1), NOW)
+    before = await get_user(svc.db, 1)
+    audits = await audit_actions(svc.db)
+    link_sub = parse_subscription(sub_payload(id="sub_link", customer="cus_from_link", metadata={}))
+    assert link_sub.telegram_id is None
+    stripe_fake.subscriptions = [trial_sub(1), link_sub]
+    result = await sync_subscriptions(svc, NOW + M)
+    assert result.ok and result.unmatched == 1 and not result.multiple
+    after = await get_user(svc.db, 1)
+    # Their own subscription was synced as usual; nothing else about them changed.
+    assert after.last_synced_at == NOW + M
+    assert dataclasses.replace(after, last_synced_at=before.last_synced_at) == before
+    assert await audit_actions(svc.db) == audits
+    assert tg.events == []
+    assert (await svc.db.fetchone("SELECT count(*) AS n FROM users"))["n"] == 1
 
 
 # --- past-due anchor -------------------------------------------------------------------
